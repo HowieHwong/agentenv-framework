@@ -30,6 +30,65 @@ def test_defaults():
     assert s.virtual_seconds_per_real_second == 1.0 and s.tolerate_missing_sync_time is True
 
 
+_LEGACY_KEYS = {"env_id", "virtual_time", "virtual_seconds_per_real_second", "tolerate_missing_sync_time", "timeout_seconds"}
+
+
+def test_a_step_without_virtual_time_from_step_id_serializes_as_before():
+    d = _step().to_dict()
+    assert _LEGACY_KEYS <= d.keys() and "virtual_time_from_step_id" not in d
+    assert d["virtual_seconds_per_real_second"] == 1.0
+    legacy = {k: v for k, v in d.items() if k != "virtual_seconds_per_real_second"}
+    assert SyncEnvClockTaskStep.from_dict(legacy).virtual_seconds_per_real_second == 1.0
+
+
+def test_round_trip_with_virtual_time_from_step_id():
+    s = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id="snap")
+    d = s.to_dict()
+    s2 = SyncEnvClockTaskStep.from_dict(d)
+    assert d["virtual_time_from_step_id"] == "snap"
+    assert s2.virtual_time_from_step_id == "snap" and s2.virtual_time is None and s2.virtual_seconds_per_real_second is None
+    assert s2.to_dict() == d
+
+
+def test_virtual_time_is_required_without_virtual_time_from_step_id():
+    with pytest.raises(ValueError, match="omit it only with virtual_time_from_step_id"):
+        SyncEnvClockTaskStep(id="s", version=1, env_id="e")
+
+
+_RECORDED = {"env_snapshot_virtual_times": {"snap": {"virtual_time": "2026-01-01T05:30:00Z", "virtual_seconds_per_real_second": 60.0}}}
+
+
+@pytest.mark.parametrize("kw, metadata, armed", [
+    ({"virtual_time_from_step_id": "snap"}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
+    ({"virtual_time_from_step_id": "snap", "virtual_seconds_per_real_second": 2.0}, _RECORDED, ("2026-01-01T05:30:00Z", 2.0)),
+    ({"virtual_time_from_step_id": "snap", "virtual_time": T0}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
+    ({"virtual_time_from_step_id": "snap", "virtual_time": T0}, {}, (T0, 1.0)),
+    ({"virtual_time_from_step_id": "other", "virtual_time": T0, "virtual_seconds_per_real_second": 3.0}, _RECORDED, (T0, 3.0)),
+], ids=["recorded", "explicit-rate-wins", "recorded-over-fallback", "fallback", "fallback-other-step"])
+@pytest.mark.asyncio
+async def test_execute_arms_at_the_recorded_time_else_the_fallback(monkeypatch, kw, metadata, armed):
+    sent = _mock_http(monkeypatch, state={"env_get_time_url": CLOCK_URL})
+    monkeypatch.setattr(SyncEnvClockTaskStep, "_service_names", lambda self, deployed: [])
+    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))], metadata=dict(metadata))
+
+    await SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", **kw).execute(context)
+
+    virtual_time, rate = armed
+    assert json.loads(sent[0].content) == {"virtual_time": virtual_time, "virtual_seconds_per_real_second": rate}
+    entry = context.metadata["clock_configurations"][-1]
+    assert (entry["virtual_time"], entry["virtual_seconds_per_real_second"]) == armed
+
+
+@pytest.mark.asyncio
+async def test_execute_raises_before_any_request_with_no_record_and_no_fallback(monkeypatch):
+    sent = _mock_http(monkeypatch)
+    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))])
+    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id="snap")
+    with pytest.raises(RuntimeError, match="step 'snap' recorded no virtual time .* no virtual_time fallback"):
+        await step.execute(context)
+    assert sent == []
+
+
 @pytest.mark.asyncio
 async def test_sync_one_skips_unadvertised(monkeypatch):
     async def fake_card(base_url, **kw):

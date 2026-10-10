@@ -3,7 +3,9 @@
 Arms the clock (set_time) and reads the gateway's server-reachable env_get_time_url (state), both as the
 stored env card declares clock/v1, then invokes sync_time on each backing server whose child env card
 advertises it. Non-advertisers are skipped when tolerate_missing_sync_time (default True). Place right
-before prompt_agent so the virtual timeline starts at agent-start.
+before prompt_agent so the virtual timeline starts at agent-start. virtual_time_from_step_id resumes the clock
+from the virtual time a snapshot_env step recorded, so an env restored from that snapshot reads no earlier than
+the records written into it.
 """
 
 from __future__ import annotations
@@ -31,22 +33,28 @@ class SyncEnvClockTaskStep(TaskStep):
         id: str,
         version: Optional[int],
         env_id: str,
-        virtual_time: str,
-        virtual_seconds_per_real_second: float = 1.0,
+        virtual_time: Optional[str] = None,
+        virtual_seconds_per_real_second: Optional[float] = None,
         tolerate_missing_sync_time: bool = True,
+        virtual_time_from_step_id: Optional[str] = None,
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         timeout_seconds: int = 30,
     ):
         """virtual_seconds_per_real_second = clock speed (1.0 real time, 0 frozen, 86400 cap =
-        1 real s -> 1 virtual day). For ~V virtual seconds over an ~R-real-second task, pass V/R."""
+        1 real s -> 1 virtual day). For ~V virtual seconds over an ~R-real-second task, pass V/R.
+        With virtual_time_from_step_id, virtual_time is the fallback when that step recorded no time, and an
+        unset rate takes the recorded one."""
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
-        if not isinstance(virtual_time, str):
-            raise ValueError("virtual_time must be an RFC3339 string")
+        if not (isinstance(virtual_time, str) or (virtual_time is None and virtual_time_from_step_id is not None)):
+            raise ValueError("virtual_time must be an RFC3339 string (omit it only with virtual_time_from_step_id)")
+        if virtual_time_from_step_id is None and virtual_seconds_per_real_second is None:
+            virtual_seconds_per_real_second = 1.0
         self.env_id = env_id
         self.virtual_time = virtual_time
         self.virtual_seconds_per_real_second = virtual_seconds_per_real_second
         self.tolerate_missing_sync_time = tolerate_missing_sync_time
+        self.virtual_time_from_step_id = virtual_time_from_step_id
         self.timeout_seconds = timeout_seconds
 
     def to_dict(self) -> dict:
@@ -56,6 +64,8 @@ class SyncEnvClockTaskStep(TaskStep):
         base["virtual_seconds_per_real_second"] = self.virtual_seconds_per_real_second
         base["tolerate_missing_sync_time"] = self.tolerate_missing_sync_time
         base["timeout_seconds"] = self.timeout_seconds
+        if self.virtual_time_from_step_id is not None:
+            base["virtual_time_from_step_id"] = self.virtual_time_from_step_id
         return base
 
     @classmethod
@@ -63,9 +73,10 @@ class SyncEnvClockTaskStep(TaskStep):
         return cls(
             **cls._base_from_dict(data),
             env_id=data["env_id"],
-            virtual_time=data["virtual_time"],
-            virtual_seconds_per_real_second=data.get("virtual_seconds_per_real_second", 1.0),
+            virtual_time=data.get("virtual_time"),
+            virtual_seconds_per_real_second=data.get("virtual_seconds_per_real_second"),
             tolerate_missing_sync_time=data.get("tolerate_missing_sync_time", True),
+            virtual_time_from_step_id=data.get("virtual_time_from_step_id"),
             timeout_seconds=data.get("timeout_seconds", 30),
         )
 
@@ -78,15 +89,37 @@ class SyncEnvClockTaskStep(TaskStep):
             names = [env.environment_name]
         return names
 
+    def _resolve_time(self, context: TaskStepContext) -> tuple[str, float]:
+        """(virtual_time, rate) to arm: the time virtual_time_from_step_id recorded, else virtual_time; an
+        explicit rate wins over the recorded one."""
+        recorded = (context.metadata.get("env_snapshot_virtual_times") or {}).get(self.virtual_time_from_step_id)
+        if recorded is not None:
+            virtual_time, rate = recorded["virtual_time"], recorded["virtual_seconds_per_real_second"]
+        elif self.virtual_time is not None:
+            if self.virtual_time_from_step_id is not None:
+                logger.info(f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no "
+                            f"virtual time; arming at virtual_time {self.virtual_time}")
+            virtual_time, rate = self.virtual_time, 1.0
+        else:
+            raise RuntimeError(
+                f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no virtual time "
+                "(it did not run, or the env's clock was not armed when it snapshotted) and no virtual_time "
+                "fallback is set"
+            )
+        if self.virtual_seconds_per_real_second is not None:
+            rate = self.virtual_seconds_per_real_second
+        return virtual_time, rate
+
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.env.env import gateway_url_of
 
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
+        virtual_time, rate = self._resolve_time(context)
         try:
             await deployed.invoke(EXT_CLOCK_URI, "set_time",
-                                  {"virtual_time": self.virtual_time, "virtual_seconds_per_real_second": self.virtual_seconds_per_real_second},
+                                  {"virtual_time": virtual_time, "virtual_seconds_per_real_second": rate},
                                   timeout=self.timeout_seconds)
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"clock arm failed (HTTP {e.response.status_code}): {e.response.text}") from e
@@ -100,10 +133,10 @@ class SyncEnvClockTaskStep(TaskStep):
 
         context.metadata.setdefault("clock_configurations", []).append({
             "step_id": self.id, "env_id": self.env_id,
-            "virtual_time": self.virtual_time, "virtual_seconds_per_real_second": self.virtual_seconds_per_real_second,
+            "virtual_time": virtual_time, "virtual_seconds_per_real_second": rate,
             "env_get_time_url": env_get_time_url, "synced": synced, "skipped": skipped,
         })
-        logger.info(f"sync_env_clock env={self.env_id}: armed rate={self.virtual_seconds_per_real_second}; "
+        logger.info(f"sync_env_clock env={self.env_id}: armed at {virtual_time} rate={rate}; "
                     f"synced={[s['service'] for s in synced]} skipped={[s['service'] for s in skipped]}")
         if not synced:
             logger.warning(f"sync_env_clock env={self.env_id}: clock armed but NO server synced "

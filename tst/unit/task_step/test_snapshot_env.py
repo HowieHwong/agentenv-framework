@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 
+import httpx
 import pytest
 from agentenv_protocol import FilePart
 from agentenv_protocol import client as protocol_v1
@@ -14,7 +15,7 @@ from agent_env.artifact import EnvironmentUniverseArtifact
 from agent_env.artifact.store import reset_artifact_store
 from agent_env.config import set_object_store
 from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, DeployedSandboxEnv
-from agent_env.env.gateway.constants import EXT_STATE_URI, GATEWAY_EXTENSIONS, WELL_KNOWN_PATH
+from agent_env.env.gateway.constants import EXT_CLOCK_URI, EXT_STATE_URI, GATEWAY_EXTENSIONS, WELL_KNOWN_PATH
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_steps import snapshot_env as snapshot_mod
@@ -208,6 +209,100 @@ async def test_execute_pins_deployed_env_version(monkeypatch):
 
     await _step().execute(_ctx(_deployed()))
     assert seen == {"env_id": "env-1", "version": 3}
+
+
+# ── virtual time ─────────────────────────────────────────────────────────────
+
+_ARMED_STATE = {"armed": True, "t0": "2026-01-01T00:00:00Z", "virtual_seconds_per_real_second": 60.0,
+                "virtual_time": "2026-01-01T02:00:00Z", "env_get_time_url": "http://gateway:9000/clock/time"}
+
+
+def _clock_answering(deployed, answer):
+    """Route the deployed env's extension calls to `answer(uri, method)`, recording each call."""
+    calls = []
+
+    async def invoke(uri, method, params=None, **kw):
+        calls.append((uri, method))
+        return answer(uri, method)
+
+    deployed.invoke = invoke
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_execute_records_the_armed_clock_under_the_step_id(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+    calls_at_export = []
+
+    async def fake_snapshot_env_state(**kwargs):
+        calls_at_export.extend(calls)
+        return snapshot_mod.EnvSnapshotResult(
+            environment_universe_artifact_id="s", environment_universe_artifact_version=1,
+            environments_snapshotted=[], total=0,
+        )
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "snapshot_env_state", staticmethod(fake_snapshot_env_state))
+    ctx = _ctx(deployed)
+
+    await _step().execute(ctx)
+
+    assert calls_at_export == calls == [(EXT_CLOCK_URI, "state")]
+    assert ctx.metadata["env_snapshot_virtual_times"] == {
+        "snap-1": {"virtual_time": "2026-01-01T02:00:00Z", "virtual_seconds_per_real_second": 60.0},
+    }
+
+
+def _raise(exc):
+    raise exc
+
+
+@pytest.mark.parametrize("answer", [
+    lambda uri, method: {"armed": False},
+    lambda uri, method: _raise(httpx.ConnectError("gateway gone")),
+], ids=["unarmed", "unreachable"])
+@pytest.mark.asyncio
+async def test_execute_records_no_virtual_time_and_still_snapshots(monkeypatch, answer):
+    _wire_fake_snapshot(monkeypatch)
+    deployed = _deployed()
+    _clock_answering(deployed, answer)
+    ctx = _ctx(deployed)
+
+    await _step().execute(ctx)
+
+    assert ctx.metadata["env_snapshotted_universes"]["snap-1"] == {"id": "s", "version": 1}
+    assert "env_snapshot_virtual_times" not in ctx.metadata
+
+
+@pytest.mark.asyncio
+async def test_execute_records_no_virtual_time_for_an_env_without_a_clock(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    deployed = _deployed()
+    deployed.environment_card = {"capabilities": {"extensions": []}}
+    ctx = _ctx(deployed)
+
+    await _step().execute(ctx)
+
+    assert ctx.metadata["env_snapshotted_universes"]["snap-1"] == {"id": "s", "version": 1}
+    assert "env_snapshot_virtual_times" not in ctx.metadata
+
+
+@pytest.mark.asyncio
+async def test_execute_records_no_virtual_time_when_the_snapshot_fails(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+
+    async def failing_snapshot(**kwargs):
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "snapshot_env_state", staticmethod(failing_snapshot))
+    deployed = _deployed()
+    _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+    ctx = _ctx(deployed)
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        await _step().execute(ctx)
+    assert "env_snapshot_virtual_times" not in ctx.metadata
 
 
 # ── env trajectory capture ───────────────────────────────────────────────────

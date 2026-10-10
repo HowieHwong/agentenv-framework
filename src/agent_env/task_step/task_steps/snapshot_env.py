@@ -21,7 +21,8 @@ from agentenv_protocol.client import find_extension
 from agentenv_protocol.transfers import WriteNamespaceGrant
 
 from agent_env.a2a_agent.object_transfer import ObjectLimits, namespace_grant
-from agent_env.env.gateway.constants import EXT_TRAJECTORY_URI
+from agent_env.env.env import EnvCapabilityUnsupported
+from agent_env.env.gateway.constants import EXT_CLOCK_URI, EXT_TRAJECTORY_URI
 from agent_env.store import get_config
 from agent_env.store.base import GrantUnavailableError
 from agent_env.store.ids import derive_id, is_local_id, validate_local_id
@@ -39,6 +40,7 @@ DEFAULT_EXPORT_CONCURRENCY = 3
 _CONNECT_TIMEOUT_SECONDS = 30
 
 _TRAJECTORY_CAPTURE_BUDGET_SECONDS = 300
+_CLOCK_READ_TIMEOUT_SECONDS = 10
 
 # Must match the S3 credentials extension URI the server-side credentials mixin advertises.
 _S3_CREDENTIALS_EXTENSION_URI = "urn:agentenv:add-s3-credentials/v1"
@@ -152,7 +154,11 @@ class SnapshotEnvTaskStep(TaskStep):
     duplicate universes.
 
     Output: ``context.metadata["env_snapshotted_universes"][self.id]`` =
-    ``{"id", "version"}``. Fails the step if any service fails to export.
+    ``{"id", "version"}``. Fails the step if any service fails to export. When
+    the env's gateway clock is armed, its virtual time as the snapshot starts is
+    recorded under ``context.metadata["env_snapshot_virtual_times"][self.id]`` =
+    ``{"virtual_time", "virtual_seconds_per_real_second"}``, for ``sync_env_clock``'s
+    ``virtual_time_from_step_id`` to resume a restored env's clock from.
     """
 
     type: ClassVar[str] = "snapshot_env"
@@ -232,6 +238,7 @@ class SnapshotEnvTaskStep(TaskStep):
             raise RuntimeError(
                 f"Deployed env '{env_id}' has no gateway_url and no override was provided"
             )
+        virtual_time = await self._read_virtual_time(deployed)
 
         if self.include_env_trajectory:
             entry: dict = {"captured_at_utc": datetime.now(timezone.utc).isoformat(), "capture_step_id": self.id}
@@ -267,9 +274,31 @@ class SnapshotEnvTaskStep(TaskStep):
             "id": result.environment_universe_artifact_id,
             "version": result.environment_universe_artifact_version,
         }
+        if virtual_time is not None:
+            context.metadata.setdefault("env_snapshot_virtual_times", {})[self.id] = virtual_time
         return context
 
     # ── internals ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _read_virtual_time(deployed) -> Optional[dict]:
+        """The armed gateway clock's ``{virtual_time, virtual_seconds_per_real_second}``, else None.
+        Read before the export so it bounds every write the agent made; never fails the snapshot."""
+        if deployed is None:
+            return None
+        try:
+            state = await deployed.invoke(EXT_CLOCK_URI, "state", timeout=_CLOCK_READ_TIMEOUT_SECONDS)
+        except EnvCapabilityUnsupported:
+            return None
+        except Exception as e:
+            logger.warning(f"snapshot_env: could not read the env clock (continuing): {type(e).__name__}: {str(e)[:200]}")
+            return None
+        if not state.get("armed") or not state.get("virtual_time"):
+            return None
+        return {
+            "virtual_time": state["virtual_time"],
+            "virtual_seconds_per_real_second": state.get("virtual_seconds_per_real_second", 1.0),
+        }
 
     @staticmethod
     def _deploy_step_of(deployed_env) -> Optional[str]:
