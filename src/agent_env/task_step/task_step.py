@@ -117,6 +117,14 @@ class TaskStep(ABC):
         """Execute this task step."""
         pass
 
+    def context_source_step_ids(self) -> list[str]:
+        """Ids of the steps whose recorded output this step reads from the context.
+
+        A task checks that each one in it is an ancestor of this step, so it has run first. An id not in
+        the task names a step of the run whose context this one is seeded with, and isn't checked.
+        """
+        return []
+
     def preflight(self) -> list[str]:
         """Config problems detectable before a run, one message each; empty when fine.
 

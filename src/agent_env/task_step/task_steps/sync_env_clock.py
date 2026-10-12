@@ -89,6 +89,9 @@ class SyncEnvClockTaskStep(TaskStep):
             names = [env.environment_name]
         return names
 
+    def context_source_step_ids(self) -> list[str]:
+        return [self.virtual_time_from_step_id] if self.virtual_time_from_step_id is not None else []
+
     def _resolve_time(self, context: TaskStepContext) -> tuple[str, float]:
         """(virtual_time, rate) to arm: the time virtual_time_from_step_id recorded, else virtual_time; an
         explicit rate wins over the recorded one."""
@@ -97,8 +100,8 @@ class SyncEnvClockTaskStep(TaskStep):
             virtual_time, rate = recorded["virtual_time"], recorded["virtual_seconds_per_real_second"]
         elif self.virtual_time is not None:
             if self.virtual_time_from_step_id is not None:
-                logger.info(f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no "
-                            f"virtual time; arming at virtual_time {self.virtual_time}")
+                logger.warning(f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no "
+                               f"virtual time; arming at the fallback virtual_time {self.virtual_time}")
             virtual_time, rate = self.virtual_time, 1.0
         else:
             raise RuntimeError(

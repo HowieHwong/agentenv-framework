@@ -1,10 +1,12 @@
 """Unit tests for SyncEnvClockTaskStep — round-trip + the per-server sync_time fan-out (mocked)."""
 import json
+import logging
 
 import pytest
 
 from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, EnvCapabilityUnsupported
 from agent_env.env.gateway.constants import EXT_CLOCK_URI
+from agent_env.task import Task
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps import sync_env_clock as mod
 from agent_env.task_step.task_steps.sync_env_clock import SyncEnvClockTaskStep
@@ -83,6 +85,49 @@ async def test_execute_arms_at_the_recorded_time_else_the_fallback(monkeypatch, 
     assert json.loads(sent[0].content) == {"virtual_time": virtual_time, "virtual_seconds_per_real_second": rate}
     entry = context.metadata["clock_configurations"][-1]
     assert (entry["virtual_time"], entry["virtual_seconds_per_real_second"]) == armed
+
+
+@pytest.mark.asyncio
+async def test_execute_warns_when_it_arms_at_the_fallback(monkeypatch, caplog):
+    _mock_http(monkeypatch, state={"env_get_time_url": CLOCK_URL})
+    monkeypatch.setattr(SyncEnvClockTaskStep, "_service_names", lambda self, deployed: [])
+    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))])
+    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time=T0, virtual_time_from_step_id="snap")
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        await step.execute(context)
+
+    assert any("step 'snap' recorded no virtual time" in r.getMessage() for r in caplog.records
+               if r.levelno == logging.WARNING)
+
+
+def _clock_from(snap_id, depends_on=None):
+    return SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id=snap_id,
+                                depends_on=depends_on)
+
+
+def _snap():
+    return SyncEnvClockTaskStep(id="snap", version=1, env_id="e1", virtual_time=T0)
+
+
+@pytest.mark.parametrize("steps", [
+    lambda: [_snap(), _clock_from("snap")],
+    lambda: [_snap(), _clock_from("snap", depends_on=["snap"])],
+    lambda: [_snap(), SyncEnvClockTaskStep(id="mid", version=1, env_id="e1", virtual_time=T0, depends_on=["snap"]),
+             _clock_from("snap", depends_on=["mid"])],
+    lambda: [_clock_from("agent-run-snap", depends_on=[])],
+], ids=["default-order", "direct-dependency", "transitive-dependency", "step-of-the-seeded-run"])
+def test_a_task_accepts_a_recording_step_that_runs_first_or_is_outside_it(steps):
+    Task(id="t", version=1, steps=steps())
+
+
+@pytest.mark.parametrize("steps", [
+    lambda: [_snap(), _clock_from("snap", depends_on=[])],
+    lambda: [_clock_from("snap", depends_on=[]), _snap()],
+], ids=["not-a-dependency", "after-it"])
+def test_a_task_refuses_a_recording_step_that_could_run_after_it(steps):
+    with pytest.raises(ValueError, match="reads the output of step 'snap', which is not in its dependency ancestry"):
+        Task(id="t", version=1, steps=steps())
 
 
 @pytest.mark.asyncio
