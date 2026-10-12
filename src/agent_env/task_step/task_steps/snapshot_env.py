@@ -285,6 +285,9 @@ class SnapshotEnvTaskStep(TaskStep):
             virtual_time = await self._read_virtual_time(deployed)
             if virtual_time is not None:
                 context.metadata.setdefault("env_snapshot_virtual_times", {})[self.id] = virtual_time
+        elif deployed is not None:
+            logger.info(f"snapshot_env: gateway_url {self.gateway_url} is not the deployed env's "
+                        f"{gateway_url_of(deployed)}; recording no virtual time")
         return context
 
     # ── internals ────────────────────────────────────────────────────────────

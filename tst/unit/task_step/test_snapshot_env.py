@@ -3,6 +3,7 @@ all-or-nothing export policy of the shared snapshot core."""
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 import httpx
@@ -296,16 +297,19 @@ async def test_execute_records_the_clock_for_a_gateway_override_to_the_same_env(
 
 
 @pytest.mark.asyncio
-async def test_execute_records_no_virtual_time_for_a_gateway_override_to_another_env(monkeypatch):
+async def test_execute_records_no_virtual_time_for_a_gateway_override_to_another_env(monkeypatch, caplog):
     _wire_fake_snapshot(monkeypatch)
     deployed = _deployed()
     calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
     ctx = _ctx(deployed)
 
-    await _step(gateway_url="https://gw-other").execute(ctx)
+    with caplog.at_level(logging.INFO, logger=snapshot_mod.__name__):
+        await _step(gateway_url="https://gw-other").execute(ctx)
 
     assert calls == []
     assert "env_snapshot_virtual_times" not in ctx.metadata
+    assert any("gateway_url https://gw-other is not the deployed env's https://gw-1; recording no virtual time"
+               in m for m in caplog.messages)
 
 
 @pytest.mark.asyncio
