@@ -275,8 +275,8 @@ class SnapshotEnvTaskStep(TaskStep):
         }
         # Read after the export, so the recorded time is no earlier than any record
         # in the snapshot. Skipped for a gateway_url override aimed at another
-        # deployment: that deployment's clock is not the one in context.
-        if not self.gateway_url or self.gateway_url == gateway_url_of(deployed):
+        # deployment: that deployment's clock is not the one in context. Compared as the export compares them.
+        if not self.gateway_url or self.gateway_url.rstrip("/") == (gateway_url_of(deployed) or "").rstrip("/"):
             virtual_time = await self._read_virtual_time(deployed)
             if virtual_time is not None:
                 context.metadata.setdefault("env_snapshot_virtual_times", {})[self.id] = virtual_time

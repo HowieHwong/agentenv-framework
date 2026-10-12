@@ -281,6 +281,20 @@ async def test_execute_records_no_virtual_time_and_still_snapshots(monkeypatch, 
     assert "env_snapshot_virtual_times" not in ctx.metadata
 
 
+@pytest.mark.parametrize("gateway_url", ["https://gw-1", "https://gw-1/"])
+@pytest.mark.asyncio
+async def test_execute_records_the_clock_for_a_gateway_override_to_the_same_env(monkeypatch, gateway_url):
+    _wire_fake_snapshot(monkeypatch)
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+    ctx = _ctx(deployed)
+
+    await _step(gateway_url=gateway_url).execute(ctx)
+
+    assert calls == [(EXT_CLOCK_URI, "state")]
+    assert ctx.metadata["env_snapshot_virtual_times"]["snap-1"]["virtual_time"] == "2026-01-01T02:00:00Z"
+
+
 @pytest.mark.asyncio
 async def test_execute_records_no_virtual_time_for_a_gateway_override_to_another_env(monkeypatch):
     _wire_fake_snapshot(monkeypatch)
