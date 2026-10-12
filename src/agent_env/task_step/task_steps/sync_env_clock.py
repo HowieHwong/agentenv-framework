@@ -36,10 +36,10 @@ class SyncEnvClockTaskStep(TaskStep):
         virtual_time: Optional[str] = None,
         virtual_seconds_per_real_second: Optional[float] = None,
         tolerate_missing_sync_time: bool = True,
-        virtual_time_from_step_id: Optional[str] = None,
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         timeout_seconds: int = 30,
+        virtual_time_from_step_id: Optional[str] = None,
     ):
         """virtual_seconds_per_real_second = clock speed (1.0 real time, 0 frozen, 86400 cap =
         1 real s -> 1 virtual day). For ~V virtual seconds over an ~R-real-second task, pass V/R.

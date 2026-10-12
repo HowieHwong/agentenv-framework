@@ -155,9 +155,9 @@ class SnapshotEnvTaskStep(TaskStep):
 
     Output: ``context.metadata["env_snapshotted_universes"][self.id]`` =
     ``{"id", "version"}``. Fails the step if any service fails to export. When
-    the env's gateway clock is armed, its virtual time as the snapshot starts is
+    the env's gateway clock is armed, its virtual time is
     recorded under ``context.metadata["env_snapshot_virtual_times"][self.id]`` =
-    ``{"virtual_time", "virtual_seconds_per_real_second"}``, for ``sync_env_clock``'s
+    ``{"virtual_time", "virtual_seconds_per_real_second"}`` once the export finishes, for ``sync_env_clock``'s
     ``virtual_time_from_step_id`` to resume a restored env's clock from.
     """
 
@@ -238,7 +238,6 @@ class SnapshotEnvTaskStep(TaskStep):
             raise RuntimeError(
                 f"Deployed env '{env_id}' has no gateway_url and no override was provided"
             )
-        virtual_time = await self._read_virtual_time(deployed)
 
         if self.include_env_trajectory:
             entry: dict = {"captured_at_utc": datetime.now(timezone.utc).isoformat(), "capture_step_id": self.id}
@@ -274,8 +273,13 @@ class SnapshotEnvTaskStep(TaskStep):
             "id": result.environment_universe_artifact_id,
             "version": result.environment_universe_artifact_version,
         }
-        if virtual_time is not None:
-            context.metadata.setdefault("env_snapshot_virtual_times", {})[self.id] = virtual_time
+        # Read after the export, so the recorded time is no earlier than any record
+        # in the snapshot. Skipped for a gateway_url override aimed at another
+        # deployment: that deployment's clock is not the one in context.
+        if not self.gateway_url or self.gateway_url == gateway_url_of(deployed):
+            virtual_time = await self._read_virtual_time(deployed)
+            if virtual_time is not None:
+                context.metadata.setdefault("env_snapshot_virtual_times", {})[self.id] = virtual_time
         return context
 
     # ── internals ────────────────────────────────────────────────────────────
@@ -283,7 +287,7 @@ class SnapshotEnvTaskStep(TaskStep):
     @staticmethod
     async def _read_virtual_time(deployed) -> Optional[dict]:
         """The armed gateway clock's ``{virtual_time, virtual_seconds_per_real_second}``, else None.
-        Read before the export so it bounds every write the agent made; never fails the snapshot."""
+        Best effort: an unreachable, unarmed or malformed clock never fails the snapshot."""
         if deployed is None:
             return None
         try:
@@ -293,11 +297,12 @@ class SnapshotEnvTaskStep(TaskStep):
         except Exception as e:
             logger.warning(f"snapshot_env: could not read the env clock (continuing): {type(e).__name__}: {str(e)[:200]}")
             return None
-        if not state.get("armed") or not state.get("virtual_time"):
+        if not isinstance(state, dict) or not state.get("armed") or not isinstance(state.get("virtual_time"), str):
             return None
+        rate = state.get("virtual_seconds_per_real_second", 1.0)
         return {
             "virtual_time": state["virtual_time"],
-            "virtual_seconds_per_real_second": state.get("virtual_seconds_per_real_second", 1.0),
+            "virtual_seconds_per_real_second": rate if isinstance(rate, (int, float)) and not isinstance(rate, bool) else 1.0,
         }
 
     @staticmethod

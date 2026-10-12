@@ -25,6 +25,12 @@ def test_round_trip():
     assert s2.virtual_time == T0 and s2.virtual_seconds_per_real_second == 3600 and s2.tolerate_missing_sync_time is True
 
 
+def test_existing_positional_arguments_keep_their_meaning():
+    s = SyncEnvClockTaskStep("sync", 1, "e", T0, 2.0, False, [], False, 45)
+    assert (s.virtual_seconds_per_real_second, s.tolerate_missing_sync_time, s.depends_on) == (2.0, False, [])
+    assert (s.fail_task_on_error, s.timeout_seconds, s.virtual_time_from_step_id) == (False, 45, None)
+
+
 def test_defaults():
     s = SyncEnvClockTaskStep(id="s", version=1, env_id="e", virtual_time=T0)
     assert s.virtual_seconds_per_real_second == 1.0 and s.tolerate_missing_sync_time is True

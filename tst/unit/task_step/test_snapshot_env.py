@@ -248,7 +248,9 @@ async def test_execute_records_the_armed_clock_under_the_step_id(monkeypatch):
 
     await _step().execute(ctx)
 
-    assert calls_at_export == calls == [(EXT_CLOCK_URI, "state")]
+    # Read once, after the export, so the time bounds every record in the snapshot.
+    assert calls_at_export == []
+    assert calls == [(EXT_CLOCK_URI, "state")]
     assert ctx.metadata["env_snapshot_virtual_times"] == {
         "snap-1": {"virtual_time": "2026-01-01T02:00:00Z", "virtual_seconds_per_real_second": 60.0},
     }
@@ -261,7 +263,11 @@ def _raise(exc):
 @pytest.mark.parametrize("answer", [
     lambda uri, method: {"armed": False},
     lambda uri, method: _raise(httpx.ConnectError("gateway gone")),
-], ids=["unarmed", "unreachable"])
+    lambda uri, method: None,
+    lambda uri, method: ["armed"],
+    lambda uri, method: "armed",
+    lambda uri, method: {"armed": True, "virtual_time": 5},
+], ids=["unarmed", "unreachable", "null", "list", "string", "non-string-time"])
 @pytest.mark.asyncio
 async def test_execute_records_no_virtual_time_and_still_snapshots(monkeypatch, answer):
     _wire_fake_snapshot(monkeypatch)
@@ -272,6 +278,19 @@ async def test_execute_records_no_virtual_time_and_still_snapshots(monkeypatch, 
     await _step().execute(ctx)
 
     assert ctx.metadata["env_snapshotted_universes"]["snap-1"] == {"id": "s", "version": 1}
+    assert "env_snapshot_virtual_times" not in ctx.metadata
+
+
+@pytest.mark.asyncio
+async def test_execute_records_no_virtual_time_for_a_gateway_override_to_another_env(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+    ctx = _ctx(deployed)
+
+    await _step(gateway_url="https://gw-other").execute(ctx)
+
+    assert calls == []
     assert "env_snapshot_virtual_times" not in ctx.metadata
 
 
