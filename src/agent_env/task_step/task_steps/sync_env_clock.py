@@ -3,14 +3,15 @@
 Arms the clock (set_time) and reads the gateway's server-reachable env_get_time_url (state), both as the
 stored env card declares clock/v1, then invokes sync_time on each backing server whose child env card
 advertises it. Non-advertisers are skipped when tolerate_missing_sync_time (default True). Place right
-before prompt_agent so the virtual timeline starts at agent-start. virtual_time_from_step_id resumes the clock
-from the virtual time a snapshot_env step recorded, so an env restored from that snapshot reads no earlier than
-the records written into it. That time is when the snapshot completed, so on a fast clock it can be well past the
-agent's last action (see snapshot_env).
+before prompt_agent so the virtual timeline starts at agent-start. resume_from_loaded_universe instead resumes
+the clock a snapshot_env snapshot recorded, from the universe last loaded into the env (place it after that load),
+so an env restored from a snapshot reads no earlier than the records written into it. That time is when the
+snapshot completed, so on a fast clock it can be well past the agent's last action (see snapshot_env).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import ClassVar, Optional
 
@@ -40,22 +41,22 @@ class SyncEnvClockTaskStep(TaskStep):
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         timeout_seconds: int = 30,
-        virtual_time_from_step_id: Optional[str] = None,
+        resume_from_loaded_universe: bool = False,
     ):
         """virtual_seconds_per_real_second = clock speed (1.0 real time, 0 frozen, 86400 cap =
         1 real s -> 1 virtual day). For ~V virtual seconds over an ~R-real-second task, pass V/R.
-        With virtual_time_from_step_id, virtual_time is the fallback when that step recorded no time, and an
-        unset rate takes the recorded one."""
+        With resume_from_loaded_universe, virtual_time is the fallback when the loaded universe recorded no
+        clock, and an unset rate takes the recorded one."""
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
-        if not (isinstance(virtual_time, str) or (virtual_time is None and virtual_time_from_step_id is not None)):
-            raise ValueError("virtual_time must be an RFC3339 string (omit it only with virtual_time_from_step_id)")
-        if virtual_time_from_step_id is None and virtual_seconds_per_real_second is None:
+        if not (isinstance(virtual_time, str) or (virtual_time is None and resume_from_loaded_universe)):
+            raise ValueError("virtual_time must be an RFC3339 string (omit it only with resume_from_loaded_universe)")
+        if not resume_from_loaded_universe and virtual_seconds_per_real_second is None:
             virtual_seconds_per_real_second = 1.0
         self.env_id = env_id
         self.virtual_time = virtual_time
         self.virtual_seconds_per_real_second = virtual_seconds_per_real_second
         self.tolerate_missing_sync_time = tolerate_missing_sync_time
-        self.virtual_time_from_step_id = virtual_time_from_step_id
+        self.resume_from_loaded_universe = resume_from_loaded_universe
         self.timeout_seconds = timeout_seconds
 
     def to_dict(self) -> dict:
@@ -65,8 +66,8 @@ class SyncEnvClockTaskStep(TaskStep):
         base["virtual_seconds_per_real_second"] = self.virtual_seconds_per_real_second
         base["tolerate_missing_sync_time"] = self.tolerate_missing_sync_time
         base["timeout_seconds"] = self.timeout_seconds
-        if self.virtual_time_from_step_id is not None:
-            base["virtual_time_from_step_id"] = self.virtual_time_from_step_id
+        if self.resume_from_loaded_universe:
+            base["resume_from_loaded_universe"] = True
         return base
 
     @classmethod
@@ -77,7 +78,7 @@ class SyncEnvClockTaskStep(TaskStep):
             virtual_time=data.get("virtual_time"),
             virtual_seconds_per_real_second=data.get("virtual_seconds_per_real_second"),
             tolerate_missing_sync_time=data.get("tolerate_missing_sync_time", True),
-            virtual_time_from_step_id=data.get("virtual_time_from_step_id"),
+            resume_from_loaded_universe=data.get("resume_from_loaded_universe", False),
             timeout_seconds=data.get("timeout_seconds", 30),
         )
 
@@ -90,25 +91,41 @@ class SyncEnvClockTaskStep(TaskStep):
             names = [env.environment_name]
         return names
 
-    def context_source_step_ids(self) -> list[str]:
-        return [self.virtual_time_from_step_id] if self.virtual_time_from_step_id is not None else []
+    @staticmethod
+    def _loaded_universe_clock(deployed) -> tuple[Optional[dict], str]:
+        """The virtual clock recorded on the universe last loaded into ``deployed``, else None and why not."""
+        from agent_env.artifact import EnvironmentUniverseArtifact
+        from agent_env.env.store import get_env_instance_store
 
-    def _resolve_time(self, context: TaskStepContext) -> tuple[str, float]:
-        """(virtual_time, rate) to arm: the time virtual_time_from_step_id recorded, else virtual_time; an
-        explicit rate wins over the recorded one."""
-        recorded = (context.metadata.get("env_snapshot_virtual_times") or {}).get(self.virtual_time_from_step_id)
+        if not deployed.instance_id:
+            return None, "the env has no instance record"
+        try:
+            ref = get_env_instance_store().get_environment_universe(deployed.instance_id)
+            if not ref or not ref.get("id"):
+                return None, "no universe was loaded into it"
+            universe = EnvironmentUniverseArtifact.get(ref["id"], version=ref.get("version"))
+        except Exception as e:
+            return None, f"its loaded universe could not be read ({type(e).__name__}: {str(e)[:200]})"
+        if universe.virtual_clock is None:
+            return None, f"universe {universe.id} v{universe.version} recorded no virtual clock"
+        return universe.virtual_clock.model_dump(), ""
+
+    async def _resolve_time(self, deployed) -> tuple[str, float]:
+        """(virtual_time, rate) to arm: the loaded universe's recorded clock when resuming from it, else
+        virtual_time; an explicit rate wins over the recorded one."""
+        recorded, why_not = (await asyncio.to_thread(self._loaded_universe_clock, deployed)
+                             if self.resume_from_loaded_universe else (None, ""))
         if recorded is not None:
             virtual_time, rate = recorded["virtual_time"], recorded["virtual_seconds_per_real_second"]
         elif self.virtual_time is not None:
-            if self.virtual_time_from_step_id is not None:
-                logger.warning(f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no "
-                               f"virtual time; arming at the fallback virtual_time {self.virtual_time}")
+            if self.resume_from_loaded_universe:
+                logger.warning(f"sync_env_clock '{self.id}': {why_not}; arming at the fallback virtual_time "
+                               f"{self.virtual_time}")
             virtual_time, rate = self.virtual_time, 1.0
         else:
             raise RuntimeError(
-                f"sync_env_clock '{self.id}': step '{self.virtual_time_from_step_id}' recorded no virtual time "
-                "(it did not run, or the env's clock was not armed when it snapshotted) and no virtual_time "
-                "fallback is set"
+                f"sync_env_clock '{self.id}': cannot resume env '{self.env_id}' from its loaded universe: {why_not}, "
+                "and no virtual_time fallback is set"
             )
         if self.virtual_seconds_per_real_second is not None:
             rate = self.virtual_seconds_per_real_second
@@ -120,7 +137,7 @@ class SyncEnvClockTaskStep(TaskStep):
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
-        virtual_time, rate = self._resolve_time(context)
+        virtual_time, rate = await self._resolve_time(deployed)
         try:
             await deployed.invoke(EXT_CLOCK_URI, "set_time",
                                   {"virtual_time": virtual_time, "virtual_seconds_per_real_second": rate},

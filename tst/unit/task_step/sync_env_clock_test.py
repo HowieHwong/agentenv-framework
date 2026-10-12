@@ -4,9 +4,10 @@ import logging
 
 import pytest
 
+from agent_env.artifact import EnvironmentUniverseArtifact
+from agent_env.artifact.artifacts.environment_universe import VirtualClockReading
 from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, EnvCapabilityUnsupported
 from agent_env.env.gateway.constants import EXT_CLOCK_URI
-from agent_env.task import Task
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps import sync_env_clock as mod
 from agent_env.task_step.task_steps.sync_env_clock import SyncEnvClockTaskStep
@@ -30,7 +31,7 @@ def test_round_trip():
 def test_existing_positional_arguments_keep_their_meaning():
     s = SyncEnvClockTaskStep("sync", 1, "e", T0, 2.0, False, [], False, 45)
     assert (s.virtual_seconds_per_real_second, s.tolerate_missing_sync_time, s.depends_on) == (2.0, False, [])
-    assert (s.fail_task_on_error, s.timeout_seconds, s.virtual_time_from_step_id) == (False, 45, None)
+    assert (s.fail_task_on_error, s.timeout_seconds, s.resume_from_loaded_universe) == (False, 45, False)
 
 
 def test_defaults():
@@ -41,45 +42,75 @@ def test_defaults():
 _LEGACY_KEYS = {"env_id", "virtual_time", "virtual_seconds_per_real_second", "tolerate_missing_sync_time", "timeout_seconds"}
 
 
-def test_a_step_without_virtual_time_from_step_id_serializes_as_before():
+def test_a_step_that_does_not_resume_serializes_as_before():
     d = _step().to_dict()
-    assert _LEGACY_KEYS <= d.keys() and "virtual_time_from_step_id" not in d
+    assert _LEGACY_KEYS <= d.keys() and "resume_from_loaded_universe" not in d
     assert d["virtual_seconds_per_real_second"] == 1.0
     legacy = {k: v for k, v in d.items() if k != "virtual_seconds_per_real_second"}
     assert SyncEnvClockTaskStep.from_dict(legacy).virtual_seconds_per_real_second == 1.0
 
 
-def test_round_trip_with_virtual_time_from_step_id():
-    s = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id="snap")
+def test_round_trip_resuming_from_the_loaded_universe():
+    s = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", resume_from_loaded_universe=True)
     d = s.to_dict()
     s2 = SyncEnvClockTaskStep.from_dict(d)
-    assert d["virtual_time_from_step_id"] == "snap"
-    assert s2.virtual_time_from_step_id == "snap" and s2.virtual_time is None and s2.virtual_seconds_per_real_second is None
+    assert d["resume_from_loaded_universe"] is True
+    assert s2.resume_from_loaded_universe and s2.virtual_time is None and s2.virtual_seconds_per_real_second is None
     assert s2.to_dict() == d
 
 
-def test_virtual_time_is_required_without_virtual_time_from_step_id():
-    with pytest.raises(ValueError, match="omit it only with virtual_time_from_step_id"):
+def test_virtual_time_is_required_unless_resuming():
+    with pytest.raises(ValueError, match="omit it only with resume_from_loaded_universe"):
         SyncEnvClockTaskStep(id="s", version=1, env_id="e")
 
 
-_RECORDED = {"env_snapshot_virtual_times": {"snap": {"virtual_time": "2026-01-01T05:30:00Z", "virtual_seconds_per_real_second": 60.0}}}
+_RECORDED = VirtualClockReading(virtual_time="2026-01-01T05:30:00Z", virtual_seconds_per_real_second=60.0)
 
 
-@pytest.mark.parametrize("kw, metadata, armed", [
-    ({"virtual_time_from_step_id": "snap"}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
-    ({"virtual_time_from_step_id": "snap", "virtual_seconds_per_real_second": 2.0}, _RECORDED, ("2026-01-01T05:30:00Z", 2.0)),
-    ({"virtual_time_from_step_id": "snap", "virtual_time": T0}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
-    ({"virtual_time_from_step_id": "snap", "virtual_time": T0}, {}, (T0, 1.0)),
-    ({"virtual_time_from_step_id": "other", "virtual_time": T0, "virtual_seconds_per_real_second": 3.0}, _RECORDED, (T0, 3.0)),
-], ids=["recorded", "explicit-rate-wins", "recorded-over-fallback", "fallback", "fallback-other-step"])
-@pytest.mark.asyncio
-async def test_execute_arms_at_the_recorded_time_else_the_fallback(monkeypatch, kw, metadata, armed):
+class _InstanceStore:
+    """The env-instance store's loaded-universe record: `loaded` per instance id, or raising `error`."""
+
+    def __init__(self, loaded=None, error=None):
+        self.loaded, self.error = loaded or {}, error
+
+    def get_environment_universe(self, instance_id):
+        if self.error:
+            raise self.error
+        return self.loaded.get(instance_id)
+
+
+def _loaded(monkeypatch, virtual_clock=None, *, instance_store=None):
+    """Put a universe recording `virtual_clock` in the local artifact store and record it as loaded into "inst-1"."""
+    from agent_env.artifact.ref import ArtifactRef
+    from agent_env.artifact.store import get_artifact_store
+
+    universe = get_artifact_store().put_document(EnvironmentUniverseArtifact(
+        id="snap-u", environment_artifact_refs=[ArtifactRef(id="snap-u__gmail", version=1)], virtual_clock=virtual_clock))
+    store = instance_store or _InstanceStore({"inst-1": {"id": universe.id, "version": universe.version}})
+    monkeypatch.setattr("agent_env.env.store.get_env_instance_store", lambda: store)
+
+
+async def _execute(monkeypatch, step, instance_id="inst-1"):
     sent = _mock_http(monkeypatch, state={"env_get_time_url": CLOCK_URL})
     monkeypatch.setattr(SyncEnvClockTaskStep, "_service_names", lambda self, deployed: [])
-    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))], metadata=dict(metadata))
+    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}), instance_id=instance_id)])
+    await step.execute(context)
+    return sent, context
 
-    await SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", **kw).execute(context)
+
+@pytest.mark.parametrize("kw, virtual_clock, armed", [
+    ({}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
+    ({"virtual_seconds_per_real_second": 2.0}, _RECORDED, ("2026-01-01T05:30:00Z", 2.0)),
+    ({"virtual_time": T0}, _RECORDED, ("2026-01-01T05:30:00Z", 60.0)),
+    ({"virtual_time": T0}, None, (T0, 1.0)),
+    ({"virtual_time": T0, "virtual_seconds_per_real_second": 3.0}, None, (T0, 3.0)),
+], ids=["recorded", "explicit-rate-wins", "recorded-over-fallback", "fallback", "fallback-with-rate"])
+@pytest.mark.asyncio
+async def test_execute_arms_at_the_loaded_universes_clock_else_the_fallback(local_stores, monkeypatch, kw, virtual_clock, armed):
+    _loaded(monkeypatch, virtual_clock)
+
+    sent, context = await _execute(monkeypatch, SyncEnvClockTaskStep(
+        id="sync", version=1, env_id="e1", resume_from_loaded_universe=True, **kw))
 
     virtual_time, rate = armed
     assert json.loads(sent[0].content) == {"virtual_time": virtual_time, "virtual_seconds_per_real_second": rate}
@@ -88,54 +119,42 @@ async def test_execute_arms_at_the_recorded_time_else_the_fallback(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_execute_warns_when_it_arms_at_the_fallback(monkeypatch, caplog):
-    _mock_http(monkeypatch, state={"env_get_time_url": CLOCK_URL})
-    monkeypatch.setattr(SyncEnvClockTaskStep, "_service_names", lambda self, deployed: [])
-    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))])
-    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time=T0, virtual_time_from_step_id="snap")
+async def test_a_step_that_does_not_resume_ignores_the_loaded_universes_clock(local_stores, monkeypatch):
+    _loaded(monkeypatch, _RECORDED)
+
+    sent, _ = await _execute(monkeypatch, _step())
+
+    assert json.loads(sent[0].content) == {"virtual_time": T0, "virtual_seconds_per_real_second": 1.0}
+
+
+@pytest.mark.parametrize("setup, instance_id, why", [
+    (lambda mp: _loaded(mp, None), "inst-1", "universe snap-u v1 recorded no virtual clock"),
+    (lambda mp: _loaded(mp, _RECORDED, instance_store=_InstanceStore()), "inst-1", "no universe was loaded into it"),
+    (lambda mp: _loaded(mp, _RECORDED, instance_store=_InstanceStore(error=RuntimeError("store down"))), "inst-1",
+     "its loaded universe could not be read (RuntimeError: store down)"),
+    (lambda mp: _loaded(mp, _RECORDED), None, "the env has no instance record"),
+], ids=["no-clock", "nothing-loaded", "store-error", "no-instance"])
+@pytest.mark.asyncio
+async def test_execute_warns_naming_why_it_arms_at_the_fallback(local_stores, monkeypatch, caplog, setup, instance_id, why):
+    setup(monkeypatch)
+    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time=T0, resume_from_loaded_universe=True)
 
     with caplog.at_level(logging.WARNING, logger=mod.__name__):
-        await step.execute(context)
+        sent, _ = await _execute(monkeypatch, step, instance_id=instance_id)
 
-    assert any("step 'snap' recorded no virtual time" in r.getMessage() for r in caplog.records
-               if r.levelno == logging.WARNING)
-
-
-def _clock_from(snap_id, depends_on=None):
-    return SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id=snap_id,
-                                depends_on=depends_on)
-
-
-def _snap():
-    return SyncEnvClockTaskStep(id="snap", version=1, env_id="e1", virtual_time=T0)
-
-
-@pytest.mark.parametrize("steps", [
-    lambda: [_snap(), _clock_from("snap")],
-    lambda: [_snap(), _clock_from("snap", depends_on=["snap"])],
-    lambda: [_snap(), SyncEnvClockTaskStep(id="mid", version=1, env_id="e1", virtual_time=T0, depends_on=["snap"]),
-             _clock_from("snap", depends_on=["mid"])],
-    lambda: [_clock_from("agent-run-snap", depends_on=[])],
-], ids=["default-order", "direct-dependency", "transitive-dependency", "step-of-the-seeded-run"])
-def test_a_task_accepts_a_recording_step_that_runs_first_or_is_outside_it(steps):
-    Task(id="t", version=1, steps=steps())
-
-
-@pytest.mark.parametrize("steps", [
-    lambda: [_snap(), _clock_from("snap", depends_on=[])],
-    lambda: [_clock_from("snap", depends_on=[]), _snap()],
-], ids=["not-a-dependency", "after-it"])
-def test_a_task_refuses_a_recording_step_that_could_run_after_it(steps):
-    with pytest.raises(ValueError, match="reads the output of step 'snap', which is not in its dependency ancestry"):
-        Task(id="t", version=1, steps=steps())
+    assert json.loads(sent[0].content)["virtual_time"] == T0
+    assert any(r.levelno == logging.WARNING and f"sync_env_clock 'sync': {why}; arming at the fallback" in r.getMessage()
+               for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_execute_raises_before_any_request_with_no_record_and_no_fallback(monkeypatch):
+async def test_execute_raises_before_any_request_with_no_recorded_clock_and_no_fallback(local_stores, monkeypatch):
+    _loaded(monkeypatch, None)
     sent = _mock_http(monkeypatch)
-    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}))])
-    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", virtual_time_from_step_id="snap")
-    with pytest.raises(RuntimeError, match="step 'snap' recorded no virtual time .* no virtual_time fallback"):
+    context = TaskStepContext(deployed_envs=[_carded(await _composed_card({}), instance_id="inst-1")])
+    step = SyncEnvClockTaskStep(id="sync", version=1, env_id="e1", resume_from_loaded_universe=True)
+    with pytest.raises(RuntimeError, match="cannot resume env 'e1' from its loaded universe: universe snap-u v1 "
+                                           "recorded no virtual clock, and no virtual_time fallback is set"):
         await step.execute(context)
     assert sent == []
 
@@ -254,11 +273,12 @@ async def _composed_card(children: dict[str, list]) -> dict:
     return json.loads((await gw._serve_env_card()).body)
 
 
-def _carded(card: dict) -> DeployedEnv:
+def _carded(card: dict, instance_id: str | None = None) -> DeployedEnv:
     from agent_env.env.gateway.constants import WELL_KNOWN_PATH
 
     return DeployedGatewayEnv(env_id="e1", env_version=1, gateway_url="http://gw", mcp_url="http://gw/mcp", db_web_url=None,
-                       sandbox_id="sb-1", environment_card_url=f"{_CARD}{WELL_KNOWN_PATH}", environment_card=card)
+                       sandbox_id="sb-1", environment_card_url=f"{_CARD}{WELL_KNOWN_PATH}", environment_card=card,
+                       instance_id=instance_id)
 
 
 def _mock_http(monkeypatch, state: dict | None = None, set_time_status: int = 200):

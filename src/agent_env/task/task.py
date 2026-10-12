@@ -316,7 +316,6 @@ class Task:
     @classmethod
     def _validate_dag(cls, steps: list[TaskStep]) -> None:
         ids = {s.id for s in steps} if any(s.depends_on is not None for s in steps) else set()
-        all_ids = {s.id for s in steps}
         seen: set[str] = set()
         for i, step in enumerate(steps):
             if step.id in seen:
@@ -337,16 +336,6 @@ class Task:
                         f"'{retry_config.retry_from_step_id}' which is not in the step's dependency "
                         f"ancestry (ancestor ids: {sorted(ancestors)})"
                     )
-            sources = getattr(step, "context_source_step_ids", None)
-            in_task = [ref for ref in sources() if ref in all_ids] if sources else []
-            if in_task:
-                ancestors = _ancestor_ids(step.id, _dependency_ids(steps[: i + 1]))
-                for ref in in_task:
-                    if ref not in ancestors:
-                        raise ValueError(
-                            f"Step '{step.id}' at position {i} reads the output of step '{ref}', which is not in "
-                            f"its dependency ancestry, so it could run first (ancestor ids: {sorted(ancestors)})"
-                        )
             if step.depends_on is None:
                 continue
             prior = {s.id for s in steps[:i]}

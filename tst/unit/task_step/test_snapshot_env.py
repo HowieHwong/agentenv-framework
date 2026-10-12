@@ -212,7 +212,7 @@ async def test_execute_pins_deployed_env_version(monkeypatch):
     assert seen == {"env_id": "env-1", "version": 3}
 
 
-# ── virtual time ─────────────────────────────────────────────────────────────
+# ── virtual clock ────────────────────────────────────────────────────────────
 
 _ARMED_STATE = {"armed": True, "t0": "2026-01-01T00:00:00Z", "virtual_seconds_per_real_second": 60.0,
                 "virtual_time": "2026-01-01T02:00:00Z", "env_get_time_url": "http://gateway:9000/clock/time"}
@@ -230,35 +230,44 @@ def _clock_answering(deployed, answer):
     return calls
 
 
-@pytest.mark.asyncio
-async def test_execute_records_the_armed_clock_under_the_step_id(monkeypatch):
-    _wire_fake_snapshot(monkeypatch)
-    deployed = _deployed()
-    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
-    calls_at_export = []
-
-    async def fake_snapshot_env_state(**kwargs):
-        calls_at_export.extend(calls)
-        return snapshot_mod.EnvSnapshotResult(
-            environment_universe_artifact_id="s", environment_universe_artifact_version=1,
-            environments_snapshotted=[], total=0,
-        )
-
-    monkeypatch.setattr(SnapshotEnvTaskStep, "snapshot_env_state", staticmethod(fake_snapshot_env_state))
-    ctx = _ctx(deployed)
-
-    await _step().execute(ctx)
-
-    # Read once, after the export, so the time bounds every record in the snapshot.
-    assert calls_at_export == []
-    assert calls == [(EXT_CLOCK_URI, "state")]
-    assert ctx.metadata["env_snapshot_virtual_times"] == {
-        "snap-1": {"virtual_time": "2026-01-01T02:00:00Z", "virtual_seconds_per_real_second": 60.0},
-    }
-
-
 def _raise(exc):
     raise exc
+
+
+async def _snapshot(monkeypatch, tmp_path, deployed, gateway_url="https://gw-1", services=("gmail", "slack"),
+                    on_export=None):
+    """Run the real snapshot core on local stores, each service exporting a bundle it uploaded itself."""
+    store = FakeObjectStore()
+    set_object_store(store)
+    reset_artifact_store()
+    bundle = tmp_path / "bundle.zip"
+    bundle.write_bytes(b"PK\x03\x04")
+
+    async def fake_export(gateway_url, name, tmp, timeout, deployed=None):
+        if on_export:
+            on_export(name)
+        return store.put_file_at(f"fake://home/snapshots/{name}.zip", str(bundle))
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "_export_environment_to_file", staticmethod(fake_export))
+    result = await SnapshotEnvTaskStep.snapshot_env_state(
+        env=_FakeMultiEnv(list(services)), gateway_url=gateway_url, snapshot_id="snap-c", deployed=deployed,
+    )
+    return EnvironmentUniverseArtifact.get(result.environment_universe_artifact_id,
+                                           version=result.environment_universe_artifact_version)
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_records_the_armed_clock_once_every_service_has_exported(local_stores, monkeypatch, tmp_path):
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+    clock_calls_at_export = []
+
+    universe = await _snapshot(monkeypatch, tmp_path, deployed, on_export=lambda name: clock_calls_at_export.append(len(calls)))
+
+    assert clock_calls_at_export == [0, 0]
+    assert calls == [(EXT_CLOCK_URI, "state")]
+    assert universe.virtual_clock.model_dump() == {
+        "virtual_time": "2026-01-01T02:00:00Z", "virtual_seconds_per_real_second": 60.0}
 
 
 @pytest.mark.parametrize("answer", [
@@ -270,76 +279,69 @@ def _raise(exc):
     lambda uri, method: {"armed": True, "virtual_time": 5},
 ], ids=["unarmed", "unreachable", "null", "list", "string", "non-string-time"])
 @pytest.mark.asyncio
-async def test_execute_records_no_virtual_time_and_still_snapshots(monkeypatch, answer):
-    _wire_fake_snapshot(monkeypatch)
+async def test_the_snapshot_records_no_clock_and_still_completes(local_stores, monkeypatch, tmp_path, answer):
     deployed = _deployed()
     _clock_answering(deployed, answer)
-    ctx = _ctx(deployed)
 
-    await _step().execute(ctx)
+    universe = await _snapshot(monkeypatch, tmp_path, deployed)
 
-    assert ctx.metadata["env_snapshotted_universes"]["snap-1"] == {"id": "s", "version": 1}
-    assert "env_snapshot_virtual_times" not in ctx.metadata
+    assert sorted(universe.get_file_artifacts()) == ["gmail/gmail.zip", "slack/slack.zip"]
+    assert universe.virtual_clock is None
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_records_no_clock_for_an_env_without_one(local_stores, monkeypatch, tmp_path):
+    deployed = _deployed()
+    deployed.environment_card = {"capabilities": {"extensions": []}}
+
+    assert (await _snapshot(monkeypatch, tmp_path, deployed)).virtual_clock is None
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_records_no_clock_for_a_gateway_override_to_another_env(local_stores, monkeypatch, tmp_path, caplog):
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+
+    with caplog.at_level(logging.INFO, logger=snapshot_mod.__name__):
+        universe = await _snapshot(monkeypatch, tmp_path, deployed, gateway_url="https://gw-other")
+
+    assert calls == []
+    assert universe.virtual_clock is None
+    assert any("gateway https://gw-other is not the deployed env's https://gw-1; recording no virtual clock" in m
+               for m in caplog.messages)
 
 
 @pytest.mark.parametrize("gateway_url", ["https://gw-1", "https://gw-1/"])
 @pytest.mark.asyncio
-async def test_execute_records_the_clock_for_a_gateway_override_to_the_same_env(monkeypatch, gateway_url):
-    _wire_fake_snapshot(monkeypatch)
-    deployed = _deployed()
-    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
-    ctx = _ctx(deployed)
-
-    await _step(gateway_url=gateway_url).execute(ctx)
-
-    assert calls == [(EXT_CLOCK_URI, "state")]
-    assert ctx.metadata["env_snapshot_virtual_times"]["snap-1"]["virtual_time"] == "2026-01-01T02:00:00Z"
-
-
-@pytest.mark.asyncio
-async def test_execute_records_no_virtual_time_for_a_gateway_override_to_another_env(monkeypatch, caplog):
-    _wire_fake_snapshot(monkeypatch)
-    deployed = _deployed()
-    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
-    ctx = _ctx(deployed)
-
-    with caplog.at_level(logging.INFO, logger=snapshot_mod.__name__):
-        await _step(gateway_url="https://gw-other").execute(ctx)
-
-    assert calls == []
-    assert "env_snapshot_virtual_times" not in ctx.metadata
-    assert any("gateway_url https://gw-other is not the deployed env's https://gw-1; recording no virtual time"
-               in m for m in caplog.messages)
-
-
-@pytest.mark.asyncio
-async def test_execute_records_no_virtual_time_for_an_env_without_a_clock(monkeypatch):
-    _wire_fake_snapshot(monkeypatch)
-    deployed = _deployed()
-    deployed.environment_card = {"capabilities": {"extensions": []}}
-    ctx = _ctx(deployed)
-
-    await _step().execute(ctx)
-
-    assert ctx.metadata["env_snapshotted_universes"]["snap-1"] == {"id": "s", "version": 1}
-    assert "env_snapshot_virtual_times" not in ctx.metadata
-
-
-@pytest.mark.asyncio
-async def test_execute_records_no_virtual_time_when_the_snapshot_fails(monkeypatch):
-    _wire_fake_snapshot(monkeypatch)
-
-    async def failing_snapshot(**kwargs):
-        raise RuntimeError("export failed")
-
-    monkeypatch.setattr(SnapshotEnvTaskStep, "snapshot_env_state", staticmethod(failing_snapshot))
+async def test_the_snapshot_records_the_clock_for_the_deployed_gateway_with_or_without_a_slash(
+        local_stores, monkeypatch, tmp_path, gateway_url):
     deployed = _deployed()
     _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
-    ctx = _ctx(deployed)
 
-    with pytest.raises(RuntimeError, match="export failed"):
-        await _step().execute(ctx)
-    assert "env_snapshot_virtual_times" not in ctx.metadata
+    universe = await _snapshot(monkeypatch, tmp_path, deployed, gateway_url=gateway_url)
+
+    assert universe.virtual_clock.virtual_time == "2026-01-01T02:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_the_clock_is_not_read_when_a_service_fails_to_export(local_stores, monkeypatch, tmp_path):
+    deployed = _deployed()
+    calls = _clock_answering(deployed, lambda uri, method: _ARMED_STATE)
+
+    def fail_slack(name):
+        if name == "slack":
+            raise ValueError("export-state returned non-JSON body")
+
+    with pytest.raises(RuntimeError, match="1/2 services were not exported"):
+        await _snapshot(monkeypatch, tmp_path, deployed, on_export=fail_slack)
+    assert calls == []
+
+
+def test_a_universe_stored_before_the_field_existed_reads_no_clock():
+    doc = {"id": "u", "version": 1, "type": "environment_universe",
+           "service_artifact_refs": [{"id": "u__gmail", "version": 1}]}
+
+    assert EnvironmentUniverseArtifact.model_validate(doc).virtual_clock is None
 
 
 # ── env trajectory capture ───────────────────────────────────────────────────
@@ -668,7 +670,7 @@ async def test_core_success_creates_universe_with_metadata(monkeypatch):
         version = 4
 
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             universe_puts.update(
                 id=id, names=[sa.environment_name for sa in environment_artifacts], metadata=metadata
             )
@@ -733,7 +735,7 @@ async def test_core_zip_export_creates_zip_filename_artifact(monkeypatch):
         version = 1
 
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             return _FakeUniverse()
 
     import agent_env.artifact as artifact_pkg
@@ -1193,7 +1195,7 @@ async def test_core_carries_metadata_from_loaded_universe(monkeypatch):
         version = 4
 
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             got["metadata"] = metadata
             return _FakeUniverse()
 
@@ -1234,7 +1236,7 @@ async def test_core_explicit_id_wins_over_loaded_universe(monkeypatch):
         version = 4
 
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             got["metadata"] = metadata
             return _FakeUniverse()
 
@@ -1272,7 +1274,7 @@ async def test_core_metadata_best_effort_when_instance_has_no_universe(monkeypat
         version = 4
 
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             got["metadata"] = metadata
             return _FakeUniverse()
 
@@ -1302,7 +1304,7 @@ async def test_core_explicit_bad_original_id_fails_fast(monkeypatch):
     """A bad explicit id surfaces (fails before exports); the auto path never would."""
     class _FakeUniverse:
         @staticmethod
-        def put(id, *, environment_artifacts, metadata=None):
+        def put(id, *, environment_artifacts, metadata=None, virtual_clock=None):
             raise AssertionError("put must not be reached")
 
         @staticmethod
