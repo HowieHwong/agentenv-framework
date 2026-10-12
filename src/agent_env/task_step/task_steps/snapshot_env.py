@@ -158,7 +158,12 @@ class SnapshotEnvTaskStep(TaskStep):
     the env's gateway clock is armed, its virtual time is
     recorded under ``context.metadata["env_snapshot_virtual_times"][self.id]`` =
     ``{"virtual_time", "virtual_seconds_per_real_second"}`` once the export finishes, for ``sync_env_clock``'s
-    ``virtual_time_from_step_id`` to resume a restored env's clock from.
+    ``virtual_time_from_step_id`` to resume a restored env's clock from. Being read
+    after the export, it is the env's "now" when the snapshot completes, not when
+    the agent stopped. It leads the agent's last action by the clock's rate times
+    the real time in between, the trajectory capture and the export included (at
+    86400, a 60 s export alone is 60 virtual days). Read any earlier and a record
+    written during the export could postdate it.
     """
 
     type: ClassVar[str] = "snapshot_env"

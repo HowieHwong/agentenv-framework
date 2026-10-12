@@ -5,7 +5,8 @@ stored env card declares clock/v1, then invokes sync_time on each backing server
 advertises it. Non-advertisers are skipped when tolerate_missing_sync_time (default True). Place right
 before prompt_agent so the virtual timeline starts at agent-start. virtual_time_from_step_id resumes the clock
 from the virtual time a snapshot_env step recorded, so an env restored from that snapshot reads no earlier than
-the records written into it.
+the records written into it. That time is when the snapshot completed, so on a fast clock it can be well past the
+agent's last action (see snapshot_env).
 """
 
 from __future__ import annotations
