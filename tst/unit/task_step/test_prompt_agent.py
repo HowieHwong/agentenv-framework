@@ -336,3 +336,75 @@ async def test_other_failed_terminal_still_raises(monkeypatch):
         await step.execute(context)
 
 
+def _serve_failed_terminal_with_trajectory(monkeypatch, *, error_code, trajectory):
+    """Like _serve_failed_terminal, but also answers the trajectory extension so the
+    partial trajectory recorded before the failure can be fetched and stored."""
+    for fn in ("create_conversation", "add_a2a_task", "complete_a2a_task",
+               "mark_closed", "get_conversation"):
+        monkeypatch.setattr(pa.conversation_store, fn, lambda *a, **kw: None)
+    monkeypatch.setattr(pa, "fetch_container_logs", AsyncMock(return_value=None))
+
+    data = {"error_type": "agent_error", "error_message": "Max turns (500) reached without completion."}
+    if error_code is not None:
+        data["error_code"] = error_code
+    status = {"state": "failed", "message": {"parts": [
+        {"kind": "text", "text": "Max turns (500) reached without completion."},
+        {"kind": "data", "data": data},
+    ]}}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/ext/trajectory":
+            assert json.loads(request.content) == {"task_id": "task-1"}
+            return httpx.Response(200, json={"trajectory": trajectory})
+        body = json.loads(request.content)
+        result = (
+            {"id": "task-1", "contextId": "ctx"}
+            if body["method"] == "message/send"
+            else {"status": status}
+        )
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    transport = httpx.MockTransport(answer)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: real_client(*a, transport=transport, **kw))
+
+
+@pytest.mark.asyncio
+async def test_max_turns_terminal_records_partial_trajectory(monkeypatch, tmp_path):
+    # Grading a budget-exhausted run is only worthwhile because of its partial
+    # trajectory: a failed max-turns terminal must still fetch and record the
+    # partial actions, and the returned response must point at the stored copy.
+    store = LocalFilesystemObjectStore(str(tmp_path))
+    configure(object_store=store)
+
+    async def sdk_get(request: TaskTrajectoryRequest | TaskObjectTrajectoryRequest):
+        return {"trajectory": []}
+
+    extensions = build_registry(
+        object(), [enable(TRAJECTORY_V1)], sdk_handlers={(TRAJECTORY_V1.uri, "get"): sdk_get}
+    ).card_extensions()
+
+    partial = [{"type": "action", "output": "click(1)"}, {"type": "action", "output": "type('x')"}]
+    _serve_failed_terminal_with_trajectory(
+        monkeypatch, error_code=MAX_TURNS_ERROR_CODE, trajectory=partial)
+
+    context = TaskStepContext(instance_id="ti-1")
+    context.deployed_agents.append(DeployedAgent(
+        agent_name="solver", api_url="http://agent.test", a2a_url="http://agent.test",
+        a2a_card={"capabilities": {"extensions": extensions}},
+    ))
+    step = PromptAgentTaskStep(
+        id="solve", version=None, prompt="hi", agent_name="solver", poll_interval_seconds=0,
+        trajectory_output_prefix=store.object_url("prompt_agent_trajectories"),
+    )
+
+    result = await step.execute(context)
+
+    assert result is context
+    pr = result.prompt_responses[-1]
+    assert pr.error_code == MAX_TURNS_ERROR_CODE
+    uri = pr.agent_trajectory_object_url
+    assert uri is not None
+    assert json.loads(store.get(uri)) == partial
+
+
