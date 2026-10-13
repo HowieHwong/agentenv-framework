@@ -1,7 +1,7 @@
 """Run a Python script in a deployed sandbox and store its JSON result.
 
 The script defines ``run(input) -> JSON``, where
-``input = {"args", "results", "verifications"}``: the step's args, earlier ``run_code`` results,
+``input = {"args", "results", "verifiers"}``: the step's args, earlier ``run_code`` results,
 and the records verifier steps wrote to ``context.metadata["verifications"]``.
 The result is stored at ``context.metadata["script_results"][result_id]``.
 
@@ -291,11 +291,11 @@ class RunCodeTaskStep(TaskStep):
         return (script_file, files)
 
     def _build_input(self, context: TaskStepContext) -> dict:
-        """Build the {args, results, verifications} input passed to the script."""
+        """Build the {args, results, verifiers} input passed to the script."""
         return {
             "args": self.args,
             "results": context.metadata.get("script_results", {}),
-            "verifications": context.metadata.get("verifications", {}),
+            "verifiers": context.metadata.get("verifications", {}),
         }
 
     def _target_kind(self) -> str:
