@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -14,6 +15,7 @@ from agent_env.config.errors import ConfigError
 from agent_env.env.gateway.constants import PRIVATE_HOST_ENV
 from agent_env.providers.sandbox_providers import hf_jobs
 from agent_env.providers.sandbox_providers.hf_jobs import HfJobsSandboxProvider
+from agent_env.providers.sandbox_providers.sandbox import NetworkMode, NetworkPolicy, NetworkPolicyUnsupportedError
 
 JOB = "6ace9550c66288145223121d"
 PREFIX = "nwa-6ace955091389f104546662a-"
@@ -68,7 +70,7 @@ def jobs(monkeypatch):
 
     monkeypatch.setattr(hf_jobs.httpx, "post", post)
     monkeypatch.setattr(hf_jobs.HubSandbox, "connect", staticmethod(lambda job_id, namespace, token: box))
-    monkeypatch.setattr(hf_jobs, "_image_command", lambda image_name: SERVER)
+    monkeypatch.setattr(hf_jobs, "_image_command", lambda image_name, args: SERVER)
     monkeypatch.setattr(hf_jobs, "_POLL_SECONDS", 0)
     provider = HfJobsSandboxProvider(token="hf_test")
     provider._api = api
@@ -101,15 +103,16 @@ def test_a_private_container_is_a_job_in_the_providers_network_group_its_port_pu
                                           True, {PRIVATE_HOST_ENV: sandbox.private_host})
 
 
-def test_a_container_off_the_internet_exposes_only_the_sandbox_server_and_runs_the_command_given(jobs, monkeypatch):
-    monkeypatch.setattr(hf_jobs, "_image_command", lambda image_name: pytest.fail("the image's own command was read"))
+def test_a_container_off_the_internet_exposes_only_the_sandbox_server_and_runs_its_image_with_the_command_given(
+        jobs, monkeypatch):
+    monkeypatch.setattr(hf_jobs, "_image_command", lambda image_name, args: ["docker-entrypoint.sh", *args])
 
     sandbox = asyncio.run(jobs.provider.create_container(
         image_name="postgres:16-alpine", port=5432, env={}, command=["postgres", "-c", "fsync=off"],
         expose_externally=False, private_network=True))
 
     assert jobs.posted[0]["expose"] == {"ports": [49983]}
-    assert _started_command(jobs.box)[0][4:] == ["postgres", "-c", "fsync=off"]
+    assert _started_command(jobs.box)[0][4:] == ["docker-entrypoint.sh", "postgres", "-c", "fsync=off"]
     assert sandbox.private_host.startswith(PREFIX)
 
 
@@ -148,6 +151,36 @@ def test_a_cancelled_create_cancels_its_job(jobs):
     asyncio.run(cancel_while_starting())
 
     assert jobs.api.cancelled == [JOB]
+
+
+def test_a_run_torn_down_while_hf_creates_a_job_cancels_the_job(jobs, monkeypatch):
+    posting, created = threading.Event(), threading.Event()
+
+    def post(url, json, headers, timeout):
+        posting.set()
+        created.wait(5)
+        return httpx.Response(200, json={"id": JOB})
+
+    monkeypatch.setattr(hf_jobs.httpx, "post", post)
+
+    async def end_while_posting():
+        asyncio.ensure_future(jobs.provider.create_container(image_name="ghcr.io/org/server:v1", port=18765, env={}))
+        await asyncio.to_thread(posting.wait, 5)
+        threading.Timer(0.1, created.set).start()
+
+    asyncio.run(end_while_posting())
+
+    assert jobs.api.cancelled == [JOB]
+
+
+def test_an_allowlist_it_cant_enforce_is_refused_before_any_job_is_created(jobs):
+    policy = NetworkPolicy(mode=NetworkMode.ALLOWLIST, allow_hosts=("workload.example",))
+
+    with pytest.raises(NetworkPolicyUnsupportedError):
+        asyncio.run(jobs.provider.create_container(image_name="ghcr.io/org/server:v1", port=18765, env={},
+                                                   network_policy=policy))
+
+    assert jobs.posted == []
 
 
 def test_a_job_is_found_again_by_its_id_with_its_alias_and_one_that_ended_can_still_be_cancelled(jobs):
@@ -191,13 +224,26 @@ def test_without_a_configured_token_the_hugging_face_login_is_used(monkeypatch):
     assert provider._network_group.startswith("agentenv-") and len(provider._network_group) <= 46
 
 
-def test_the_image_command_is_its_entrypoint_then_cmd(monkeypatch):
+def test_a_huggingface_hub_whose_sandbox_helpers_changed_is_refused_as_the_provider_is_built(monkeypatch):
+    monkeypatch.setattr(hf_jobs.hub_sandbox, "_bootstrap_job_spec", lambda api, hf_token, *, env, secrets: None)
+    monkeypatch.delattr(hf_jobs.hub_sandbox, "_derive_sandbox_token")
+
+    with pytest.raises(ConfigError, match="_bootstrap_job_spec takes no forward_hf_token, idle_timeout, sandbox_token, "
+                                          "volumes; no _derive_sandbox_token"):
+        HfJobsSandboxProvider.from_config(token="hf_test")
+
+
+@pytest.mark.parametrize("args, command", [
+    (None, ["docker-entrypoint.sh", "postgres"]),
+    (["postgres", "-c", "fsync=off"], ["docker-entrypoint.sh", "postgres", "-c", "fsync=off"]),
+])
+def test_the_image_command_is_its_entrypoint_then_the_args_given_or_its_cmd(monkeypatch, args, command):
     monkeypatch.setattr(hf_jobs, "image_config",
                         lambda ref, auth: {"Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["postgres"]})
     monkeypatch.setattr(hf_jobs, "get_config", lambda: SimpleNamespace(
         get_image_store_at=lambda name: SimpleNamespace(auth=lambda ref: None)))
 
-    assert hf_jobs._image_command("postgres:16-alpine") == ["docker-entrypoint.sh", "postgres"]
+    assert hf_jobs._image_command("postgres:16-alpine", args) == command
 
 
 def test_the_job_spec_is_json(jobs):

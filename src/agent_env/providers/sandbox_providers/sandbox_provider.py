@@ -194,6 +194,8 @@ class SandboxProvider(ABC):
     _DECLARES_SANDBOX_ACCEPTS: ClassVar[bool] = False
     # Whether create_container(private_network=True) puts containers on a network they share.
     PRIVATE_NETWORK: ClassVar[bool] = False
+    # The host a server in such a container listens on to be reached there: "::", every IPv6 address, for Modal's i6pn.
+    PRIVATE_LISTEN_HOST: ClassVar[str] = "::"
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

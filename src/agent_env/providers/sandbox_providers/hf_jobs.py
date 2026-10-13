@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import inspect
 import logging
 import re
 import secrets
@@ -15,6 +16,7 @@ import time
 from typing import Any, ClassVar, Optional, Self
 
 import httpx
+import huggingface_hub
 from huggingface_hub import HfApi, get_token
 from huggingface_hub import Sandbox as HubSandbox
 from huggingface_hub import _sandbox as hub_sandbox
@@ -29,6 +31,7 @@ from agent_env.providers.sandbox_providers.sandbox_provider import (
     Accepts,
     SandboxProvider,
     apply_default_attribution,
+    refuse_unenforceable_policy,
 )
 from agent_env.store.image_store.registry_api import image_config
 
@@ -44,9 +47,22 @@ _TERMINAL_STAGES = ("COMPLETED", "ERROR", "DELETED", "CANCELED")
 # Pulling a large image dominates a job's start; HF caps no job's queueing, so this bounds it.
 _RUNNING_TIMEOUT_SECONDS = 600
 _EXEC_READY_TIMEOUT_SECONDS = 120
+_EXEC_PROBE_TIMEOUT_SECONDS = 10
 _POLL_SECONDS = 2
+_POST_TIMEOUT_SECONDS = 60
+_DOWNLOAD_TIMEOUT_SECONDS = 120
+# How long a cancelled create waits for its POST to end; past it the cancel goes on, and the job the POST creates is
+# cancelled when it ends.
+_CANCELLED_CREATE_WAIT_SECONDS = 30
 _LABEL_VALUE_MAX_LEN = 63
 _LABEL_UNSAFE = re.compile(r"[^a-zA-Z0-9._-]")
+# The private huggingface_hub helpers the provider calls, with the keywords it passes them; checked as it's built, so a
+# release that changes them fails there rather than mid-deploy.
+_HUB_HELPERS = {
+    "_bootstrap_job_spec": {"env", "secrets", "volumes", "idle_timeout", "forward_hf_token", "sandbox_token"},
+    "_derive_sandbox_token": set(),
+    "_tail_job_logs": {"namespace"},
+}
 SANDBOX_STARTED_EVENT = "agent_env.hf_job_started"
 
 
@@ -106,7 +122,7 @@ class HfJobsSandbox(Sandbox):
 
     async def write_file_from_url(self, url: str, destination_path: str) -> None:
         with tempfile.TemporaryFile() as spool:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as client:
                 async with client.stream("GET", url) as response:
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes():
@@ -131,6 +147,8 @@ class HfJobsSandboxProvider(SandboxProvider):
     # its registry must serve it publicly.
     CONTAINER_ACCEPTS = Accepts.NAME
     PRIVATE_NETWORK = True
+    # A network group routes IPv4, which a "::" listener misses: asyncio binds it to IPv6 alone.
+    PRIVATE_LISTEN_HOST = "0.0.0.0"
 
     def __init__(self, token: str, namespace: str | None = None, flavor: str = "cpu-basic",
                  network_group: str | None = None):
@@ -153,6 +171,10 @@ class HfJobsSandboxProvider(SandboxProvider):
         if not token:
             raise ConfigError(f"{section} needs a 'token' (a secret: or env: reference), or a Hugging Face login: "
                               "`hf auth login`, or HF_TOKEN")
+        if changed := _hub_helpers_changed():
+            raise ConfigError(f"The hf_jobs provider runs on huggingface_hub's private sandbox helpers, which "
+                              f"huggingface_hub {huggingface_hub.__version__} changed ({'; '.join(changed)}); install "
+                              "one it runs on, such as 1.33")
         return cls(**{**config, "token": token})
 
     async def create_container(
@@ -171,8 +193,9 @@ class HfJobsSandboxProvider(SandboxProvider):
         expose_externally: bool = True,
         private_network: bool = False,
     ) -> Sandbox:
+        refuse_unenforceable_policy(self, network_policy)
         effective = self.effective_network_policy(network_policy)
-        launch = command or await asyncio.to_thread(_image_command, image_name)
+        launch = await asyncio.to_thread(_image_command, image_name, command)
         alias = f"c{secrets.token_hex(6)}" if private_network else None
         namespace = await self._resolved_namespace()
         spec = self._job_spec(image_name, port=port, env=env, timeout=timeout, attribution=attribution, alias=alias,
@@ -263,7 +286,7 @@ class HfJobsSandboxProvider(SandboxProvider):
 
     def _post_job(self, namespace: str, spec: dict) -> str:
         response = httpx.post(f"{self._api.endpoint}/api/jobs/{namespace}", json=spec,
-                              headers={"Authorization": f"Bearer {self._token}"}, timeout=60)
+                              headers={"Authorization": f"Bearer {self._token}"}, timeout=_POST_TIMEOUT_SECONDS)
         if response.status_code >= 400:
             raise RuntimeError(f"HF Jobs refused the job for {spec['dockerImage']}: HTTP {response.status_code}: "
                                f"{response.text[:500]}")
@@ -298,19 +321,31 @@ class HfJobsSandboxProvider(SandboxProvider):
 
 async def _created(post, cancel) -> str:
     """The id of the job ``post`` creates. HF may create it even when this is cancelled, so the request runs on and
-    the job it creates is cancelled: a cancelled create leaves nothing running."""
-    creating = asyncio.ensure_future(asyncio.to_thread(post))
+    the job it creates is cancelled before the cancel goes on: a cancelled create leaves nothing running. The request
+    is a future, not a task, so a loop's shutdown, which cancels every task, doesn't drop the job it creates."""
+    creating = asyncio.get_running_loop().run_in_executor(None, post)
     try:
         return await asyncio.shield(creating)
     except asyncio.CancelledError:
-        def cancel_created(done: asyncio.Future) -> None:
-            if not done.cancelled() and done.exception() is None:
-                task = asyncio.get_running_loop().create_task(cancel(done.result()))
-                _LATE_CANCELS.add(task)
-                task.add_done_callback(_LATE_CANCELS.discard)
-
-        creating.add_done_callback(cancel_created)
+        job_id = None
+        try:
+            job_id = await asyncio.wait_for(asyncio.shield(creating), _CANCELLED_CREATE_WAIT_SECONDS)
+        except (Exception, asyncio.CancelledError):  # it failed, outlasted the wait, or a second cancel came
+            # A create that ended just as the wait gave up runs the callback at once
+            creating.add_done_callback(functools.partial(_cancel_when_created, cancel))
+            if not creating.done():
+                logger.warning("A cancelled HF job create is still waiting on HF; the job it creates, if any, is "
+                               "cancelled when it ends")
+        if job_id is not None:
+            await cancel(job_id)
         raise
+
+
+def _cancel_when_created(cancel, done: asyncio.Future) -> None:
+    if not done.cancelled() and done.exception() is None:
+        task = asyncio.get_running_loop().create_task(cancel(done.result()))
+        _LATE_CANCELS.add(task)
+        task.add_done_callback(_LATE_CANCELS.discard)
 
 
 # Cancels started after their create's own cancel had gone on, kept so they run to their end.
@@ -321,13 +356,13 @@ async def _exec_ready(box: HubSandbox, job_id: str) -> None:
     deadline = time.monotonic() + _EXEC_READY_TIMEOUT_SECONDS
     while True:
         try:
-            await asyncio.to_thread(box.run, ["true"], timeout=10)
+            await asyncio.to_thread(box.run, ["true"], timeout=_EXEC_PROBE_TIMEOUT_SECONDS)
             return
         except Exception as e:  # the server isn't up yet, or not yet reachable
             if time.monotonic() > deadline:
                 raise TimeoutError(f"its sandbox server didn't answer within {_EXEC_READY_TIMEOUT_SECONDS} s: "
                                    f"{e}") from e
-            await asyncio.sleep(1)
+            await asyncio.sleep(_POLL_SECONDS)
 
 
 async def _private_host(box: HubSandbox, alias: str) -> str:
@@ -340,12 +375,24 @@ async def _private_host(box: HubSandbox, alias: str) -> str:
     return f"{prefix}{alias}"
 
 
-def _image_command(image_name: str) -> list[str]:
-    """The command ``image_name`` runs, its ENTRYPOINT then CMD, read from its registry: the job's own command starts
-    HF's sandbox server instead, which then starts this one."""
+def _hub_helpers_changed() -> list[str]:
+    """How this huggingface_hub's private sandbox helpers differ from what the provider calls them with."""
+    changed = []
+    for name, keywords in _HUB_HELPERS.items():
+        helper = getattr(hub_sandbox, name, None)
+        if helper is None:
+            changed.append(f"no {name}")
+        elif missing := keywords - set(inspect.signature(helper).parameters):
+            changed.append(f"{name} takes no {', '.join(sorted(missing))}")
+    return changed
+
+
+def _image_command(image_name: str, args: list[str] | None) -> list[str]:
+    """The command ``image_name`` runs as Docker runs it, read from its registry: its ENTRYPOINT, then ``args`` in place
+    of its CMD. The job's own command starts HF's sandbox server instead, which then starts this one."""
     auth = get_config().get_image_store_at(image_name).auth(image_name)
     config = image_config(image_name, auth)
-    command = [*(config.get("Entrypoint") or []), *(config.get("Cmd") or [])]
+    command = [*(config.get("Entrypoint") or []), *(args or config.get("Cmd") or [])]
     if not command:
         raise ValueError(f"{image_name} has no ENTRYPOINT or CMD to run")
     return command

@@ -1,8 +1,8 @@
 """HF Jobs smoke test.
 
-Runs when the resolved config can build the ``hf_jobs`` sandbox provider (the ``hf`` extra and a Hugging Face token,
-configured in ``[sandbox.providers.hf_jobs.config]`` or from ``hf auth login``) — the ``remote_sandbox`` capability —
-and skips with the declared reason otherwise. Two cpu-basic jobs run for a minute or two, a cent's worth of credits.
+Runs when the resolved config can build the ``hf_jobs`` sandbox provider (a Hugging Face token, configured in
+``[sandbox.providers.hf_jobs.config]`` or from ``hf auth login``) — the ``remote_sandbox`` capability — and skips with
+the declared reason otherwise. Two cpu-basic jobs run for a minute or two, a cent's worth of credits.
 """
 
 from __future__ import annotations
