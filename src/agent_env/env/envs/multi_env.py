@@ -212,17 +212,24 @@ class MultiEnv(Env):
         # Keyed on the service images rather than self.id, so re-registering the same
         # servers under a new env id still hits (and a rebuilt server correctly misses).
         env_fingerprint = compute_env_fingerprint(self) if can_restore else None
+        preloaded = await self._delivered_with(environment_universe_artifact)
         snapshot = get_env_snapshot_store().get_clean(
             self.id,
             environment_universe_artifact.id,
             environment_universe_artifact.version,
             env_fingerprint=env_fingerprint,
-        ) if can_restore else None
+        ) if can_restore and not preloaded else None
         restored_from_snapshot = False
         snapshot_baked: bool | None = None
         snapshot_bake_error: str | None = None
 
-        if snapshot:
+        if preloaded:
+            logger.info(
+                "env=%s was delivered with universe %s v%s already loaded and untouched; "
+                "skipping the data load",
+                self.id, environment_universe_artifact.id, environment_universe_artifact.version,
+            )
+        elif snapshot:
             logger.info(f"Found clean snapshot for env={self.id} universe={environment_universe_artifact.id}: artifact={snapshot.db_image_artifact_id} v{snapshot.db_image_artifact_version} instance={snapshot.instance_id}")
             await self._load_from_snapshot(snapshot)
             restored_from_snapshot = True
@@ -334,7 +341,7 @@ class MultiEnv(Env):
         # image swap. Deliberately placed here: after the universe stamp, which
         # EnvSnapshot.create reads back off the instance record, and before the metadata
         # download, so the captured PGDATA reflects the data load and nothing else.
-        if not restored_from_snapshot and can_restore:
+        if not restored_from_snapshot and not preloaded and can_restore:
             if snapshot_after_load is None:
                 snapshot_after_load = _snapshot_after_load_default()
             if snapshot_after_load:
@@ -366,6 +373,33 @@ class MultiEnv(Env):
             snapshot_baked=snapshot_baked,
             snapshot_bake_error=snapshot_bake_error,
         )
+
+    async def _delivered_with(self, environment_universe_artifact) -> bool:
+        """Whether this deployment was handed over with this universe already loaded, and
+        nothing has touched its data since.
+
+        Only the provider that made the deployment can say so, by setting
+        ``preloaded_universe`` on the record it returns: a warm pool, say, that loaded the
+        universe before anyone asked for it. This is what lets a complete load be skipped
+        where resume never skips one. Resume can't tell a caller's explicit load from a
+        retry, but here the deployment itself guarantees the data is the universe asked
+        for. The changelog gate still applies, so data touched since breaks the guarantee
+        and the universe loads as usual.
+        """
+        preloaded = getattr(self._deployed, "preloaded_universe", None) or {}
+        if (preloaded.get("id"), preloaded.get("version")) != (
+            environment_universe_artifact.id, environment_universe_artifact.version,
+        ):
+            return False
+        if self._sandbox is None or self._sandbox.mode == SANDBOX_MODE_CONTAINER:
+            return False
+        try:
+            from agent_env.env.snapshot_store import _check_changelog_empty
+
+            return await _check_changelog_empty(self._sandbox)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not confirm the preloaded universe is untouched (%s); loading it", e)
+            return False
 
     async def _resumable_environments(self, environment_universe_artifact, total: int) -> set[str]:
         """Services safe to skip because a previous attempt already loaded them.

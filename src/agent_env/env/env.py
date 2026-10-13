@@ -79,6 +79,7 @@ class DeployedEnv:
     instance_id: Optional[str] = None
     created_at_utc: Optional[str] = None
     expires_at_utc: Optional[str] = None
+    preloaded_universe: Optional[dict] = None
 
     def __post_init__(self) -> None:
         # Only older records lack their card: they keep the stored values.
@@ -134,6 +135,7 @@ class DeployedEnv:
             instance_id=data.get("instance_id"),
             created_at_utc=data.get("created_at_utc"),
             expires_at_utc=data.get("expires_at_utc"),
+            preloaded_universe=data.get("preloaded_universe"),
         )
 
 
