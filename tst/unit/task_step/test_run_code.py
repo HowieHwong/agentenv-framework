@@ -649,6 +649,33 @@ def test_sandbox_name_round_trips_through_to_dict_from_dict():
     assert RunCodeTaskStep.from_dict(d).to_dict() == d
 
 
+@pytest.mark.asyncio
+async def test_script_reads_earlier_verifier_records(tmp_path):
+    universe = _universe({
+        "run.py": b"def run(inp):\n    return {'state': inp['verifications']['audit']['state'],"
+        b" 'results': inp['results']}\n",
+    })
+    metadata = {
+        "verifications": {"audit": {"state": "completed", "results": []}},
+        "script_results": {"prev": {"n": 1}},
+    }
+    with _real_run(tmp_path, universe):
+        ctx = await _step(result_id="r").execute(_make_context(metadata=metadata))
+
+    assert ctx.metadata["script_results"]["r"] == {
+        "state": "completed", "results": {"prev": {"n": 1}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_script_gets_empty_verifications_when_no_verifier_ran(tmp_path):
+    universe = _universe({"run.py": b"def run(inp):\n    return {'v': inp['verifications']}\n"})
+    with _real_run(tmp_path, universe):
+        ctx = await _step(result_id="r").execute(_make_context())
+
+    assert ctx.metadata["script_results"]["r"] == {"v": {}}
+
+
 # --- multi-file script artifacts (FileArtifactUniverse) ---
 
 
