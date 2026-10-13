@@ -12,6 +12,7 @@ import logging
 import re
 import secrets
 import tempfile
+import threading
 import time
 from typing import Any, ClassVar, Optional, Self
 
@@ -51,10 +52,14 @@ _EXEC_PROBE_TIMEOUT_SECONDS = 10
 _POLL_SECONDS = 2
 _POST_TIMEOUT_SECONDS = 60
 _DOWNLOAD_TIMEOUT_SECONDS = 120
-# How long a cancelled create waits for its POST to end; past it the cancel goes on, and the job the POST creates is
-# cancelled when it ends.
-_CANCELLED_CREATE_WAIT_SECONDS = 30
-_LABEL_VALUE_MAX_LEN = 63
+_ERROR_TEXT_MAX_CHARS = 500
+# Random bytes, as hex: in the provider's network group's name, in each container's alias in it, and in each job's
+# sandbox-token nonce.
+_GROUP_ID_BYTES = 8
+_ALIAS_BYTES = 6
+_NONCE_BYTES = 16
+_LABEL_MAX_LEN = 63
+_LABEL_KEY = re.compile(rf"[a-zA-Z0-9._-]{{1,{_LABEL_MAX_LEN}}}")
 _LABEL_UNSAFE = re.compile(r"[^a-zA-Z0-9._-]")
 # The private huggingface_hub helpers the provider calls, with the keywords it passes them; checked as it's built, so a
 # release that changes them fails there rather than mid-deploy.
@@ -156,7 +161,7 @@ class HfJobsSandboxProvider(SandboxProvider):
         self._api = HfApi(token=token)
         self._namespace = namespace
         self._flavor = flavor
-        self._network_group = network_group or f"agentenv-{secrets.token_hex(8)}"
+        self._network_group = network_group or f"agentenv-{secrets.token_hex(_GROUP_ID_BYTES)}"
 
     @classmethod
     def from_config(cls, **config: Any) -> Self:
@@ -196,11 +201,11 @@ class HfJobsSandboxProvider(SandboxProvider):
         refuse_unenforceable_policy(self, network_policy)
         effective = self.effective_network_policy(network_policy)
         launch = await asyncio.to_thread(_image_command, image_name, command)
-        alias = f"c{secrets.token_hex(6)}" if private_network else None
+        alias = f"c{secrets.token_hex(_ALIAS_BYTES)}" if private_network else None
         namespace = await self._resolved_namespace()
         spec = self._job_spec(image_name, port=port, env=env, timeout=timeout, attribution=attribution, alias=alias,
                               exposed=expose_externally)
-        job_id = await _created(functools.partial(self._post_job, namespace, spec), self._cancel)
+        job_id = await _created(functools.partial(self._post_job, namespace, spec), self._cancel_job)
         try:
             return await self._started(job_id, namespace, port=port, launch=launch, alias=alias,
                                        exposed=expose_externally, image_name=image_name, spec=spec,
@@ -255,7 +260,7 @@ class HfJobsSandboxProvider(SandboxProvider):
         """The Jobs API spec of a job that runs HF's sandbox server, whose bootstrap huggingface_hub builds (it pins the
         server's digest). The run's env goes in as secrets, kept out of the job's spec; every process gets it all the
         same."""
-        nonce = secrets.token_hex(16)
+        nonce = secrets.token_hex(_NONCE_BYTES)
         command, job_env, job_secrets, volumes = hub_sandbox._bootstrap_job_spec(
             self._api, self._token, env=None, secrets=env, volumes=None, idle_timeout=None, forward_hf_token=False,
             sandbox_token=hub_sandbox._derive_sandbox_token(self._token, nonce),
@@ -289,7 +294,7 @@ class HfJobsSandboxProvider(SandboxProvider):
                               headers={"Authorization": f"Bearer {self._token}"}, timeout=_POST_TIMEOUT_SECONDS)
         if response.status_code >= 400:
             raise RuntimeError(f"HF Jobs refused the job for {spec['dockerImage']}: HTTP {response.status_code}: "
-                               f"{response.text[:500]}")
+                               f"{response.text[:_ERROR_TEXT_MAX_CHARS]}")
         return response.json()["id"]
 
     async def _running(self, job_id: str, namespace: str):
@@ -306,10 +311,12 @@ class HfJobsSandboxProvider(SandboxProvider):
             await asyncio.sleep(_POLL_SECONDS)
 
     async def _cancel(self, job_id: str) -> None:
+        await asyncio.to_thread(self._cancel_job, job_id)
+
+    def _cancel_job(self, job_id: str) -> None:
         """Cancel ``job_id``; one already ended is left as it is."""
         try:
-            namespace = await self._resolved_namespace()
-            await asyncio.to_thread(self._api.cancel_job, job_id=job_id, namespace=namespace)
+            self._api.cancel_job(job_id=job_id, namespace=self._namespace)
         except Exception as e:
             logger.warning(f"Couldn't cancel HF job {job_id}; it runs until its timeout unless it has ended: {e}")
 
@@ -319,37 +326,31 @@ class HfJobsSandboxProvider(SandboxProvider):
         return self._namespace
 
 
-async def _created(post, cancel) -> str:
-    """The id of the job ``post`` creates. HF may create it even when this is cancelled, so the request runs on and
-    the job it creates is cancelled before the cancel goes on: a cancelled create leaves nothing running. The request
-    is a future, not a task, so a loop's shutdown, which cancels every task, doesn't drop the job it creates."""
-    creating = asyncio.get_running_loop().run_in_executor(None, post)
+async def _created(post, cancel_job) -> str:
+    """The id of the job ``post`` creates. HF may create it even when this is cancelled, so the request runs on, and
+    whichever ends second, the request or the cancel, cancels its job: when the cancel came first, the request's own
+    thread does as it ends, with no event loop to outlive, so a loop's shutdown leaves nothing running."""
+    lock = threading.Lock()
+    state: dict[str, Any] = {"job_id": None, "abandoned": False}
+
+    def post_and_record() -> str:
+        job_id = post()
+        with lock:
+            state["job_id"] = job_id
+            abandoned = state["abandoned"]
+        if abandoned:
+            cancel_job(job_id)
+        return job_id
+
     try:
-        return await asyncio.shield(creating)
+        return await asyncio.to_thread(post_and_record)
     except asyncio.CancelledError:
-        job_id = None
-        try:
-            job_id = await asyncio.wait_for(asyncio.shield(creating), _CANCELLED_CREATE_WAIT_SECONDS)
-        except (Exception, asyncio.CancelledError):  # it failed, outlasted the wait, or a second cancel came
-            # A create that ended just as the wait gave up runs the callback at once
-            creating.add_done_callback(functools.partial(_cancel_when_created, cancel))
-            if not creating.done():
-                logger.warning("A cancelled HF job create is still waiting on HF; the job it creates, if any, is "
-                               "cancelled when it ends")
+        with lock:
+            state["abandoned"] = True
+            job_id = state["job_id"]
         if job_id is not None:
-            await cancel(job_id)
+            await asyncio.to_thread(cancel_job, job_id)
         raise
-
-
-def _cancel_when_created(cancel, done: asyncio.Future) -> None:
-    if not done.cancelled() and done.exception() is None:
-        task = asyncio.get_running_loop().create_task(cancel(done.result()))
-        _LATE_CANCELS.add(task)
-        task.add_done_callback(_LATE_CANCELS.discard)
-
-
-# Cancels started after their create's own cancel had gone on, kept so they run to their end.
-_LATE_CANCELS: set[asyncio.Task] = set()
 
 
 async def _exec_ready(box: HubSandbox, job_id: str) -> None:
@@ -414,9 +415,9 @@ def _attribution_labels(attribution: Optional[Attribution]) -> dict[str, str]:
     ``[a-zA-Z0-9._-]`` and 63 characters."""
     labels = {}
     for key, value in apply_default_attribution(dict(attribution or {})).items():
-        if value is None or not re.fullmatch(r"[a-zA-Z0-9._-]{1,63}", key):
+        if value is None or not _LABEL_KEY.fullmatch(key):
             continue
-        labels[key] = _LABEL_UNSAFE.sub("-", str(value))[:_LABEL_VALUE_MAX_LEN]
+        labels[key] = _LABEL_UNSAFE.sub("-", str(value))[:_LABEL_MAX_LEN]
     return labels
 
 
