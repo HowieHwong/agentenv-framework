@@ -36,6 +36,7 @@ def test_deployed_env_roundtrip_preserves_all_fields():
         created_at_utc=None,
         expires_at_utc=None,
         gateway_mode="performance",
+        preloaded_universe={"id": "uni", "version": 39},
         sandbox_ids={
             "gateway_server": "sb-gw",
             "mcp_server": {"slack": "sb-1", "email": "sb-2"},
@@ -232,3 +233,19 @@ def test_instance_ids_do_not_follow_a_reseeded_random():
         ids.append(store.create_instance(DeployedEnv(env_id="portsim", env_version=1), ttl_seconds=60).instance_id)
 
     assert ids[0] != ids[1]
+
+
+def test_clearing_the_preloaded_universe_survives_a_reload():
+    """A reattach rebuilds the deployment from this record; a voided guarantee must stay void."""
+    set_document_store(FakeDocumentStore())
+    store = EnvInstanceStore()
+    registered = store.create_instance(
+        DeployedGatewayEnv(env_id="e", env_version=1, sandbox_id="sb", gateway_url="https://gw.example/",
+                           preloaded_universe={"id": "uni", "version": 39}),
+        ttl_seconds=60,
+    )
+    assert store.get(registered.instance_id).preloaded_universe == {"id": "uni", "version": 39}
+
+    store.clear_preloaded_universe(registered.instance_id)
+
+    assert store.get(registered.instance_id).preloaded_universe is None

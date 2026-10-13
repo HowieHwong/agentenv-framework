@@ -73,7 +73,7 @@ async def _load(env, universe, *, changelog_empty=True, changelog_error=None):
          patch("agent_env.env.snapshot_store._check_changelog_empty", changelog), \
          patch("agent_env.env.store.update_env_instance_environment_universe", stamp):
         result = await env.load_environment_universe_artifact(universe, snapshot_after_load=True)
-    return MagicMock(loaded=loaded, snapshots=snapshots, stamp=stamp, result=result)
+    return MagicMock(loaded=loaded, snapshots=snapshots, stamp=stamp, result=result, instances=instances)
 
 
 @pytest.mark.asyncio
@@ -164,3 +164,52 @@ def test_the_guarantee_survives_the_instance_record():
     back = DeployedEnv.from_dict(dataclasses.asdict(record))
     assert type(back) is DeployedGatewayEnv
     assert back.preloaded_universe == {"id": "uni", "version": 39}
+
+
+def _universe_named(name: str, version: int = 39):
+    ua = _universe(version)
+    ua.id = name
+    return ua
+
+
+@pytest.mark.asyncio
+async def test_loading_another_universe_voids_the_guarantee():
+    """A load reinstalls each service's changelog triggers, which empties the changelog. A
+    guarantee for A surviving a load of B would pass that gate on the next request for A,
+    and skip a load the data needs."""
+    env = _env(preloaded={"id": "uni", "version": 39})
+    await _load(env, _universe_named("other"))
+
+    run = await _load(env, _universe_named("uni"))
+
+    assert sorted(run.loaded) == sorted(SERVICES)
+
+
+@pytest.mark.asyncio
+async def test_the_void_reaches_the_stored_record():
+    """So a reattach, which rebuilds the deployment from the record, can't revive it."""
+    env = _env(preloaded={"id": "uni", "version": 39})
+
+    run = await _load(env, _universe_named("other"))
+
+    run.instances.clear_preloaded_universe.assert_called_once_with("inst-1")
+    assert env._deployed.preloaded_universe is None
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_load_keeps_the_guarantee():
+    """Nothing replaced the data, so asking for the same universe again skips again."""
+    env = _env(preloaded={"id": "uni", "version": 39})
+
+    run = await _load(env, _universe())
+
+    run.instances.clear_preloaded_universe.assert_not_called()
+    assert env._deployed.preloaded_universe == {"id": "uni", "version": 39}
+    assert (await _load(env, _universe())).loaded == []
+
+
+@pytest.mark.asyncio
+async def test_a_deployment_with_no_guarantee_writes_nothing():
+    run = await _load(_env(preloaded=None), _universe())
+
+    run.instances.clear_preloaded_universe.assert_not_called()

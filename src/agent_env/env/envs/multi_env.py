@@ -213,6 +213,8 @@ class MultiEnv(Env):
         # servers under a new env id still hits (and a rebuilt server correctly misses).
         env_fingerprint = compute_env_fingerprint(self) if can_restore else None
         preloaded = await self._delivered_with(environment_universe_artifact)
+        if not preloaded:
+            self._void_preloaded_universe()
         snapshot = get_env_snapshot_store().get_clean(
             self.id,
             environment_universe_artifact.id,
@@ -400,6 +402,26 @@ class MultiEnv(Env):
         except Exception as e:  # noqa: BLE001
             logger.warning("Could not confirm the preloaded universe is untouched (%s); loading it", e)
             return False
+
+    def _void_preloaded_universe(self) -> None:
+        """Drop the deployment's preloaded guarantee before a load replaces its data.
+
+        A load reinstalls each service's changelog triggers, which empties the changelog.
+        Left standing, a guarantee for universe A would survive loading B and pass the
+        changelog gate on the next request for A, skipping a load the data needs. Cleared on
+        the stored record too, so a reattach can't revive it.
+        """
+        if not getattr(self._deployed, "preloaded_universe", None):
+            return
+        self._deployed.preloaded_universe = None
+        if not self._instance_id:
+            return
+        try:
+            from agent_env.env.store import get_env_instance_store
+
+            get_env_instance_store().clear_preloaded_universe(self._instance_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not void the preloaded universe on instance %s: %s", self._instance_id, e)
 
     async def _resumable_environments(self, environment_universe_artifact, total: int) -> set[str]:
         """Services safe to skip because a previous attempt already loaded them.

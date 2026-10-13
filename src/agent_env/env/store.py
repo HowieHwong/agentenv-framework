@@ -300,6 +300,14 @@ class EnvInstanceStore:
             UpdateSpec(set={"loaded_environments": {}}),
         )
 
+    def clear_preloaded_universe(self, instance_id: str) -> None:
+        """Void the universe an instance was delivered with, once a load replaces its data."""
+        self._doc_store.update(
+            ENV_INSTANCES_COLLECTION,
+            Filter.of(instance_id=instance_id),
+            UpdateSpec(set={"preloaded_universe": None}),
+        )
+
     def merge_metadata(self, instance_id: str, values: dict) -> None:
         """Merge key/values into an instance record's ``metadata``.
 
