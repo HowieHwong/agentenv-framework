@@ -49,16 +49,47 @@ def attach_retry_config(step: "TaskStep", data: dict[str, Any]) -> "TaskStep":
     return step
 
 
-UNFORWARDED_BASE_FIELDS = ("retry_config", "when")
+UNFORWARDED_BASE_FIELDS = ("retry_config", "when", "if_dependency_skipped")
+SKIPPED_STEPS_KEY = "skipped_steps"
+_IF_DEPENDENCY_SKIPPED = ("skip", "run")
 
 
 def attach_base_fields(step: "TaskStep", data: dict[str, Any]) -> "TaskStep":
-    """Hydrate the base fields step ``__init__``s don't forward (``retry_config``, ``when``)
-    after ``step_cls.from_dict``, so they survive every round-trip. No-op for absent fields."""
+    """Hydrate the base fields step ``__init__``s don't forward (``retry_config``, ``when``,
+    ``if_dependency_skipped``) after ``step_cls.from_dict``, so they survive every round-trip."""
     attach_retry_config(step, data)
     if data.get("when") is not None and getattr(step, "when", None) is None:
         step.when = check_when(data["when"])
+    if data.get("if_dependency_skipped") is not None:
+        step.if_dependency_skipped = check_if_dependency_skipped(data["if_dependency_skipped"])
     return step
+
+
+def check_if_dependency_skipped(value: Any) -> str:
+    if value in _IF_DEPENDENCY_SKIPPED:
+        return value
+    raise ValueError(f"if_dependency_skipped is 'skip' or 'run', not {value!r}")
+
+
+def skip_reason(step: "TaskStep", context: TaskStepContext) -> str | None:
+    """Why ``step`` is skipped in this run, or None to run it: its seed-substituted ``when`` is false, or a
+    step it names in ``depends_on`` was skipped (unless it sets ``if_dependency_skipped: run``). Implicit
+    ordering (``depends_on`` None) does not carry a skip. Skips are read from ``context.metadata``, so a
+    resumed run, or a runner that dispatches steps one at a time, sees the earlier ones."""
+    when = getattr(step, "when", None)
+    if not evaluate_when(when):
+        return f"when={when!r}"
+    if getattr(step, "if_dependency_skipped", "skip") == "run":
+        return None
+    skipped = {s["step_id"] for s in context.metadata.get(SKIPPED_STEPS_KEY) or []}
+    for dep in getattr(step, "depends_on", None) or []:
+        if dep.task_step_id in skipped:
+            return f"dependency {dep.task_step_id!r} was skipped"
+    return None
+
+
+def record_skip(step: "TaskStep", context: TaskStepContext, reason: str) -> None:
+    context.metadata.setdefault(SKIPPED_STEPS_KEY, []).append({"step_id": step.id, "reason": reason})
 
 
 _WHEN_TRUE = frozenset({"true", "yes", "on", "1"})
@@ -74,8 +105,8 @@ def check_when(when: Any) -> str | bool:
 
 
 def evaluate_when(when: str | bool | None) -> bool:
-    """Whether a step with this ``when`` runs; a skipped step is recorded SKIPPED and unblocks its dependents.
-    None always runs; a string must, after seed substitution, be true/yes/on/1 or false/no/off/0/empty."""
+    """Whether a step with this ``when`` runs. None always runs; a string must, after seed
+    substitution, be true/yes/on/1 or false/no/off/0/empty."""
     if when is None or isinstance(when, bool):
         return when is not False
     value = when.strip().lower()
@@ -144,6 +175,7 @@ class TaskStep(ABC):
         fail_task_on_error: bool = True,
         retry_config: Optional["RetryConfig | dict"] = None,
         when: Optional[str | bool] = None,
+        if_dependency_skipped: str = "skip",
     ):
         self.id = id
         self.version = version
@@ -153,6 +185,7 @@ class TaskStep(ABC):
             retry_config = RetryConfig.from_dict(retry_config)
         self.retry_config = retry_config
         self.when = None if when is None else check_when(when)
+        self.if_dependency_skipped = check_if_dependency_skipped(if_dependency_skipped)
 
     @abstractmethod
     async def execute(self, context: TaskStepContext) -> TaskStepContext | None:
@@ -182,6 +215,8 @@ class TaskStep(ABC):
             base["retry_config"] = dataclasses.asdict(self.retry_config)
         if getattr(self, "when", None) is not None:
             base["when"] = self.when
+        if getattr(self, "if_dependency_skipped", "skip") != "skip":
+            base["if_dependency_skipped"] = self.if_dependency_skipped
         return base
 
     @classmethod

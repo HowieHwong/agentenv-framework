@@ -19,7 +19,7 @@ from agent_env.plugins import _registration
 from agent_env.store.routing import run_scope
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
-from agent_env.task_step.task_step import RetryConfig, TaskStep, evaluate_when
+from agent_env.task_step.task_step import RetryConfig, TaskStep, record_skip, skip_reason
 
 if TYPE_CHECKING:
     from agent_env.task.store import TaskInstance, TaskQuery
@@ -585,9 +585,11 @@ class Task:
             started_utc = datetime.now(timezone.utc).isoformat()
             status = _store.TaskStepStatus.SUCCESS
             try:
-                if evaluate_when(getattr(step, "when", None)):
+                reason = skip_reason(step, context)
+                if reason is None:
                     await step.execute(context)
                 else:
+                    record_skip(step, context, reason)
                     status = _store.TaskStepStatus.SKIPPED
             except asyncio.CancelledError:
                 raise
@@ -606,7 +608,7 @@ class Task:
             duration = time.monotonic() - started_mono
             await _heartbeat_step(step, pre_context, status, dispatch_epoch)
             if status is _store.TaskStepStatus.SKIPPED:
-                logger.info("%sStep %s (%s) skipped: when=%r", log_prefix, step.id, step.type, getattr(step, "when", None))
+                logger.info("%sStep %s (%s) skipped: %s", log_prefix, step.id, step.type, reason)
             else:
                 logger.info(
                     "%sStep %s (%s) completed in %.1fs",
