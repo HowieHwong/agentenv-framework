@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 import time
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
@@ -25,6 +28,10 @@ _COLORS = {Outcome.PASSED: "green", Outcome.BELOW_ONE: "yellow", Outcome.UNSCORE
 _ENV_ENDPOINTS = (("mcp", "mcp_url"), ("gateway", "gateway_url"), ("pgweb", "db_web_url"), ("db-mcp", "db_mcp_url"),
                   ("vnc", "vnc_url"), ("expires", "expires_at_utc"))
 _DRY_RUN = "Dry run: nothing is written or run."
+# How many of a task's failed criteria the summary names before it counts the rest.
+_SHOWN_CRITERIA = 5
+# How much of a failed criterion's reason fits its summary line.
+_REASON_CHARS = 160
 
 
 @click.command()
@@ -39,57 +46,93 @@ _DRY_RUN = "Dry run: nothing is written or run."
               help="Keep the sandboxes up after the runs, print their endpoints, and tear them down on Ctrl-C.")
 @click.option("--dry-run", is_flag=True,
               help="Check the bundle as the run does and show what it would write and run; write and run nothing.")
+@click.option("--fail-under", type=click.FloatRange(0, 1), default=None, metavar="SCORE",
+              help="Exit 1 when a task scored below SCORE, or recorded no score; --fail-under 1 fails on any miss.")
 @click.pass_context
 def run(ctx: click.Context, bundle: str | None, tasks: tuple[str, ...], evals: tuple[str, ...], model: str | None,
-        sandbox: str | None, keep: bool, dry_run: bool):
+        sandbox: str | None, keep: bool, dry_run: bool, fail_under: float | None):
     """Run a bundle's tasks and evals, or list the installed bundles.
 
     BUNDLE is a folder, or the name of a bundle an installed package provides (PACKAGE/NAME when several
     packages provide that name). Without BUNDLE, it lists the installed bundles.
 
     With no --task or --eval, it runs every eval or, in a bundle without evals, every task. Each task runs
-    once, at most four at a time, and the run exits 1 if any of them failed. With --verbose, a run that
-    raised prints its traceback.
+    once, at most four at a time, and the run exits 1 if any of them failed. A task that scored below 1 lists
+    the criteria that failed and why, and exits 1 only under --fail-under, which also fails a task that
+    recorded no score. With --verbose, a run that raised prints its traceback.
 
     --dry-run makes the checks the run makes before its first task, reading the stores as the run does, and
     prints what it would write and run, writing and running nothing. It exits 1 on a problem the run would
-    stop at, and 0 otherwise; --model and --keep change nothing it shows. It takes no lock, so another run
-    can write first and change what it shows.
+    stop at, and 0 otherwise; --model, --keep and --fail-under change nothing it shows. It takes no lock, so
+    another run can write first and change what it shows.
 
     Each run's sandboxes are torn down as it ends; its instance and outputs stay. --keep holds them up
     until Ctrl-C instead. Ctrl-C or SIGTERM mid-run cancels the runs, tears them down, prints what ran and
     exits 130 (143 for SIGTERM); a second one stops the teardown and prints what is still up.
     """
     if bundle is None:
-        if tasks or evals or model or sandbox or keep or dry_run:
-            raise click.UsageError("--task, --eval, --model, --sandbox, --keep and --dry-run need a BUNDLE to run")
+        if tasks or evals or model or sandbox or keep or dry_run or fail_under is not None:
+            raise click.UsageError("--task, --eval, --model, --sandbox, --keep, --dry-run and --fail-under need a "
+                                   "BUNDLE to run")
         _list_installed()
         return
     root, id_root = _locate(bundle)
     verbose = ctx.find_root().params.get("verbose")
     try:
         if dry_run:
-            click.echo(_DRY_RUN)
-            _report_dry_run(dry_run_bundle(root, tasks=tasks, evals=evals, sandbox=sandbox, on_progress=click.echo,
-                                           id_root=id_root))
+            _echo(_DRY_RUN)
+            dry = dry_run_bundle(root, tasks=tasks, evals=evals, sandbox=sandbox, on_progress=_echo, id_root=id_root)
+            with _reader_may_leave():
+                _report_dry_run(dry)
             return
-        result = run_bundle(root, tasks=tasks, evals=evals, model=model, sandbox=sandbox, on_progress=click.echo,
+        result = run_bundle(root, tasks=tasks, evals=evals, model=model, sandbox=sandbox, on_progress=_echo,
                             id_root=id_root, keep=keep)
     except BundleError as e:
         _note_an_installed_namesake(e, bundle, root, id_root)
         raise
     except RunInterrupted as stop:
-        with Interrupts():
+        with Interrupts(), _reader_may_leave():
             _summarize(stop.result, verbose)
             _report_teardown(stop.result)
         raise SystemExit(128 + stop.signum) from None
     with Interrupts() as interrupts:
-        _summarize(result, verbose)
+        with _reader_may_leave():
+            _summarize(result, verbose)
         if keep:
             result = _hold(result, interrupts)
-        _report_teardown(result)
-    if result.failed:
+        with _reader_may_leave():
+            _report_teardown(result)
+    below = result.below(fail_under) if fail_under is not None else ()
+    with _reader_may_leave():
+        _report_below(result, below, fail_under)
+    if result.failed or below:
         raise SystemExit(1)
+
+
+def _echo(line: str) -> None:
+    """``click.echo`` for the run's progress, which stops printing once stdout's reader has gone, as when piped
+    into head, so the run still finishes and tears down."""
+    with _reader_may_leave():
+        click.echo(line)
+
+
+@contextmanager
+def _reader_may_leave() -> Iterator[None]:
+    """Print the block's output, or, once stdout's reader has gone, send the rest of the output nowhere."""
+    try:
+        yield
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+
+
+def _report_below(result: BundleRun, below: tuple[TaskRun, ...], threshold: float | None) -> None:
+    if not below:
+        return
+    shown = ", ".join(f"{result.path(run.entry)} ({min(run.scores.values()):g})" if run.scores
+                      else f"{result.path(run.entry)} (no score)" for run in below)
+    click.echo(f"\nBelow --fail-under {threshold:g}: {shown}")
 
 
 def _path_like(text: str) -> bool:
@@ -173,6 +216,8 @@ def _summarize(result: BundleRun, verbose: bool) -> None:
     click.echo("Tasks:")
     for run in result.runs:
         click.echo(click.style(f"  {_described(result, run)}", fg=_COLORS[run.outcome]))
+        for line in _failed_criteria(run):
+            click.echo(f"    {line}")
     if result.evals:
         click.echo("Evals:")
     for eval_run in result.evals:
@@ -186,6 +231,21 @@ def _summarize(result: BundleRun, verbose: bool) -> None:
                    f"--task {shlex.quote(entry.name)}")
     if verbose:
         _print_tracebacks(result)
+
+
+def _failed_criteria(run: TaskRun) -> list[str]:
+    """A line for each criterion the run failed, its step, the criterion and the reason it gave, up to
+    ``_SHOWN_CRITERIA``, then a count of the rest."""
+    failed = run.failed_criteria
+    lines = []
+    for criterion in failed[:_SHOWN_CRITERIA]:
+        reason = " ".join(criterion.reason.split())
+        if len(reason) > _REASON_CHARS:
+            reason = reason[:_REASON_CHARS - 1].rstrip() + "…"
+        lines.append(f"{criterion.step}: {criterion.criterion}" + (f": {reason}" if reason else ""))
+    if len(failed) > _SHOWN_CRITERIA:
+        lines.append(f"and {len(failed) - _SHOWN_CRITERIA} more")
+    return lines
 
 
 def _report_dry_run(dry: DryRun) -> None:

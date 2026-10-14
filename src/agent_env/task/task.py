@@ -120,13 +120,64 @@ def substitute_seed_in_steps(steps: list["TaskStep"], seed: dict) -> list["TaskS
 def recorded_scores(steps: list["TaskStep"], context: TaskStepContext) -> dict[str, float]:
     """Every score a run of ``steps`` recorded, by the id of the step that recorded it, or by its verification's key
     when that isn't a step's verifier id."""
-    step_ids = {step.verifier_id: step.id for step in steps if getattr(step, "verifier_id", None)}
+    step_ids = _verifier_steps(steps)
     scores = {}
     for key, verification in (context.metadata.get("verifications") or {}).items():
         score = verification.get("score")
         if isinstance(score, (int, float)):
             scores[step_ids.get(key, key)] = float(score)
     return scores
+
+
+@dataclass(frozen=True)
+class FailedCriterion:
+    """A criterion a verification recorded as failed."""
+
+    step: str  # the id of the step that recorded it, or its verification's key
+    criterion: str
+    reason: str  # the verifier's justification or message, "" when it gave none
+
+
+def failed_criteria(steps: list["TaskStep"], context: TaskStepContext) -> list[FailedCriterion]:
+    """Each criterion that failed in a verification scoring below 1: its result is false, or, recording no result,
+    its score is below 1. A skipped criterion didn't fail."""
+    step_ids = _verifier_steps(steps)
+    failed = []
+    for key, verification in (context.metadata.get("verifications") or {}).items():
+        score = verification.get("score")
+        if not isinstance(score, (int, float)) or score >= 1:
+            continue
+        for index, result in enumerate(verification.get("results") or []):
+            if not isinstance(result, dict) or result.get("skipped"):
+                continue
+            passed = bool(result["result"]) if "result" in result else not _below_one(result.get("score"))
+            if not passed:
+                failed.append(FailedCriterion(step_ids.get(key, key), _criterion(result, index), _reason(result)))
+    return failed
+
+
+def _verifier_steps(steps: list["TaskStep"]) -> dict[str, str]:
+    """The id of each step that records a verification, by its verifier id."""
+    return {step.verifier_id: step.id for step in steps if getattr(step, "verifier_id", None)}
+
+
+def _below_one(score: object) -> bool:
+    return isinstance(score, (int, float)) and score < 1
+
+
+def _criterion(result: dict, index: int) -> str:
+    """How a result names its criterion: verifiers name it differently, and some only by its type."""
+    for key in ("criterion", "id", "name"):
+        if isinstance(result.get(key), str) and result[key]:
+            return result[key]
+    return f"{result['type']} #{index}" if isinstance(result.get("type"), str) else f"#{index}"
+
+
+def _reason(result: dict) -> str:
+    for key in ("justification", "message", "reason", "description"):
+        if isinstance(result.get(key), str) and result[key].strip():
+            return result[key]
+    return ""
 
 
 def _dependency_ids(steps: list["TaskStep"]) -> dict[str, set[str]]:

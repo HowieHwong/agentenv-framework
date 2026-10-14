@@ -120,10 +120,27 @@ def test_a_bundle_runs_from_its_folder_and_a_rerun_writes_only_what_changed(bund
     third = _run(bundle)
     assert "artifacts/greeting: v2 (files changed: hello.txt)" in third
     assert "tasks/hello.json v1: scored below 1 (hello: 0)" in third
+    assert "\n    hello: greets: does not contain 'hello'\n" in third
     (instance_id,) = re.findall(r"instance (\S+)", third)
     with namespace_routing():
         results = Task.get_instance(instance_id).context["metadata"]["verifications"]["hello"]["results"]
     assert [(result["criterion"], result["result"]) for result in results] == [("greets", False), ("check passes", False)]
+
+    gated = CliRunner().invoke(cli, ["run", str(bundle), "--fail-under", "1"])
+    assert gated.exit_code == 1, gated.output
+    assert gated.output.endswith("\nBelow --fail-under 1: tasks/hello.json (0)\n"), gated.output
+
+
+def test_a_run_whose_reader_leaves_finishes_quietly_and_tears_down(bundle):
+    """As when piped into head: the reader closes the pipe after one line, and the run goes on to its end."""
+    process = subprocess.Popen([sys.executable, "-m", "agent_env.cli", "run", str(bundle)], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    process.stdout.readline()
+    process.stdout.close()
+    errors = process.stderr.read()
+
+    assert process.wait(timeout=120) == 0, errors
+    assert "BrokenPipeError" not in errors, errors
 
 
 @skip_without_gnu_stat()
