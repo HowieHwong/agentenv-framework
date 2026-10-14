@@ -7,8 +7,6 @@ import shlex
 import sys
 import time
 import traceback
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 import click
@@ -82,8 +80,7 @@ def run(ctx: click.Context, bundle: str | None, tasks: tuple[str, ...], evals: t
         if dry_run:
             _echo(_DRY_RUN)
             dry = dry_run_bundle(root, tasks=tasks, evals=evals, sandbox=sandbox, on_progress=_echo, id_root=id_root)
-            with _reader_may_leave():
-                _report_dry_run(dry)
+            _report_dry_run(dry)
             return
         result = run_bundle(root, tasks=tasks, evals=evals, model=model, sandbox=sandbox, on_progress=_echo,
                             id_root=id_root, keep=keep)
@@ -91,39 +88,29 @@ def run(ctx: click.Context, bundle: str | None, tasks: tuple[str, ...], evals: t
         _note_an_installed_namesake(e, bundle, root, id_root)
         raise
     except RunInterrupted as stop:
-        with Interrupts(), _reader_may_leave():
+        with Interrupts():
             _summarize(stop.result, verbose)
             _report_teardown(stop.result)
         raise SystemExit(128 + stop.signum) from None
     with Interrupts() as interrupts:
-        with _reader_may_leave():
-            _summarize(result, verbose)
+        _summarize(result, verbose)
         if keep:
             result = _hold(result, interrupts)
-        with _reader_may_leave():
-            _report_teardown(result)
+        _report_teardown(result)
     below = result.below(fail_under) if fail_under is not None else ()
-    with _reader_may_leave():
-        _report_below(result, below, fail_under)
+    _report_below(result, below, fail_under)
     if result.failed or below:
         raise SystemExit(1)
 
 
-def _echo(line: str) -> None:
-    """``click.echo`` for the run's progress, which stops printing once stdout's reader has gone, as when piped
-    into head, so the run still finishes and tears down."""
-    with _reader_may_leave():
-        click.echo(line)
-
-
-@contextmanager
-def _reader_may_leave() -> Iterator[None]:
-    """Print the block's output, or, once stdout's reader has gone, send the rest of the output nowhere."""
+def _echo(message: str | None = None, err: bool = False) -> None:
+    """``click.echo``, which drops the line once its stream's reader has gone, as when piped into head, so the run
+    still finishes and tears down."""
     try:
-        yield
+        click.echo(message, err=err)
     except BrokenPipeError:
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        os.dup2(devnull, (sys.stderr if err else sys.stdout).fileno())
         os.close(devnull)
 
 
@@ -132,7 +119,7 @@ def _report_below(result: BundleRun, below: tuple[TaskRun, ...], threshold: floa
         return
     shown = ", ".join(f"{result.path(run.entry)} ({min(run.scores.values()):g})" if run.scores
                       else f"{result.path(run.entry)} (no score)" for run in below)
-    click.echo(f"\nBelow --fail-under {threshold:g}: {shown}")
+    _echo(f"\nBelow --fail-under {threshold:g}: {shown}")
 
 
 def _path_like(text: str) -> bool:
@@ -177,21 +164,21 @@ def _installed() -> tuple[InstalledBundle, ...]:
 def _list_installed() -> None:
     bundles = _installed()
     if not bundles:
-        click.echo("No bundles are installed. agent-env run PATH runs a folder.")
+        _echo("No bundles are installed. agent-env run PATH runs a folder.")
         return
     header = ("NAME", "PACKAGE", "CONTENTS", "DESCRIPTION")
     rows = [(run_name(bundle, bundles), f"{bundle.package} {bundle.version}", *_contents(bundle)) for bundle in bundles]
     widths = [max(len(row[i]) for row in (header, *rows)) for i in range(3)]
 
     def echo(name: str, package: str, contents: str, description: str) -> None:
-        click.echo(f"{name:<{widths[0]}}  {package:<{widths[1]}}  {contents:<{widths[2]}}  {description}".rstrip())
+        _echo(f"{name:<{widths[0]}}  {package:<{widths[1]}}  {contents:<{widths[2]}}  {description}".rstrip())
 
     echo(*header)
     for bundle, row in zip(bundles, rows):
         echo(*row)
         if bundle.root is not None:
-            click.echo(f"{'':<{widths[0]}}  {bundle.root}")
-    click.echo("\nRun one with agent-env run NAME. To change one, copy its folder and run the copy.")
+            _echo(f"{'':<{widths[0]}}  {bundle.root}")
+    _echo("\nRun one with agent-env run NAME. To change one, copy its folder and run the copy.")
 
 
 def _contents(bundle: InstalledBundle) -> tuple[str, str]:
@@ -212,23 +199,23 @@ def _count(entries, kind: BundleKind, noun: str) -> str:
 
 
 def _summarize(result: BundleRun, verbose: bool) -> None:
-    click.echo()
-    click.echo("Tasks:")
+    _echo()
+    _echo("Tasks:")
     for run in result.runs:
-        click.echo(click.style(f"  {_described(result, run)}", fg=_COLORS[run.outcome]))
+        _echo(click.style(f"  {_described(result, run)}", fg=_COLORS[run.outcome]))
         for line in _failed_criteria(run):
-            click.echo(f"    {line}")
+            _echo(f"    {line}")
     if result.evals:
-        click.echo("Evals:")
+        _echo("Evals:")
     for eval_run in result.evals:
         passed, failed, cancelled = (sum(run.outcome is outcome for run in eval_run.runs)
                                      for outcome in (Outcome.PASSED, Outcome.FAILED, Outcome.CANCELLED))
         line = f"  {result.path(eval_run.entry)} v{eval_run.version}: {passed} of {len(eval_run.runs)} passed"
         rest = [f"{failed} failed" if failed else "", f"{cancelled} cancelled" if cancelled else ""]
-        click.echo(", ".join([line, *filter(None, rest)]))
+        _echo(", ".join([line, *filter(None, rest)]))
     for entry in result.skipped:
-        click.echo(f"{result.path(entry)} isn't named by any eval, so it didn't run; run it with "
-                   f"--task {shlex.quote(entry.name)}")
+        _echo(f"{result.path(entry)} isn't named by any eval, so it didn't run; run it with "
+              f"--task {shlex.quote(entry.name)}")
     if verbose:
         _print_tracebacks(result)
 
@@ -251,45 +238,45 @@ def _failed_criteria(run: TaskRun) -> list[str]:
 def _report_dry_run(dry: DryRun) -> None:
     materialization = dry.materialization
     plan = materialization.plan
-    click.echo()
+    _echo()
     if plan.store_refs:
-        click.echo("Store refs:")
+        _echo("Store refs:")
     for ref in plan.store_refs:
         if ref.version is None:
-            click.echo(f"  {ref.kind} {ref.id} v{plan.store_latest[ref.kind, ref.id]}, the latest")
+            _echo(f"  {ref.kind} {ref.id} v{plan.store_latest[ref.kind, ref.id]}, the latest")
         else:
-            click.echo(f"  {ref.kind} {ref.id} v{ref.version}")
+            _echo(f"  {ref.kind} {ref.id} v{ref.version}")
     if images := dry.images():
-        click.echo("Images:")
+        _echo("Images:")
     for line in images:
-        click.echo(f"  {line}")
+        _echo(f"  {line}")
     if dry.infra:
-        click.echo("Would build first:")
+        _echo("Would build first:")
     for build in dry.infra:
-        click.echo(f"  {build}")
-    click.echo("Would run:")
+        _echo(f"  {build}")
+    _echo("Would run:")
     for entry in dry.runs:
-        click.echo(f"  {dry.path(entry)} v{materialization.version_of('task', entry.id)}")
+        _echo(f"  {dry.path(entry)} v{materialization.version_of('task', entry.id)}")
     if plan.evals:
-        click.echo("Evals:")
+        _echo("Evals:")
     for entry in plan.evals:
         named = ", ".join(dry.path(ref.local) for ref in entry.references)
-        click.echo(f"  {dry.path(entry.entry)} v{materialization.version_of('eval', entry.entry.id)}: {named}")
+        _echo(f"  {dry.path(entry.entry)} v{materialization.version_of('eval', entry.entry.id)}: {named}")
     for entry in dry.skipped:
-        click.echo(f"{dry.path(entry)} isn't named by any eval, so it wouldn't run; run it with "
-                   f"--task {shlex.quote(entry.name)}")
+        _echo(f"{dry.path(entry)} isn't named by any eval, so it wouldn't run; run it with "
+              f"--task {shlex.quote(entry.name)}")
     if materialization.not_preflighted:
-        click.echo("Not preflighted, since each reads what the run would write first:")
+        _echo("Not preflighted, since each reads what the run would write first:")
     for write, step in materialization.not_preflighted:
-        click.echo(f"  {dry.path(write.source.entry)}: step {step.id!r} ({step.type})")
-    click.echo(_DRY_RUN)
+        _echo(f"  {dry.path(write.source.entry)}: step {step.id!r} ({step.type})")
+    _echo(_DRY_RUN)
 
 
 def _print_tracebacks(result: BundleRun) -> None:
     for run in result.runs:
         if run.error is not None:
-            click.echo(f"\n{result.path(run.entry)} raised:", err=True)
-            click.echo("".join(traceback.format_exception(run.error)).rstrip(), err=True)
+            _echo(f"\n{result.path(run.entry)} raised:", err=True)
+            _echo("".join(traceback.format_exception(run.error)).rstrip(), err=True)
 
 
 def _described(result: BundleRun, run: TaskRun) -> str:
@@ -314,22 +301,22 @@ def _hold(result: BundleRun, interrupts: Interrupts) -> BundleRun:
     kept = [run for run in result.runs if run.torn_down is None]
     count = sum(len(TeardownReport.skipped(run.context).left) for run in kept)
     if not count:
-        click.echo("\nNothing to keep up: no run left a sandbox.")
+        _echo("\nNothing to keep up: no run left a sandbox.")
         return result
-    click.echo("\nKept up:")
+    _echo("\nKept up:")
     for run in kept:
         lines = _kept_up(run.context)
         if lines:
-            click.echo(f"  {result.path(run.entry)}")
+            _echo(f"  {result.path(run.entry)}")
             for line in lines:
-                click.echo(f"    {line}")
+                _echo(f"    {line}")
     them = "it" if count == 1 else "them"
-    click.echo(f"\nHolding {_sandboxes(count)} up; Ctrl-C tears {them} down.")
+    _echo(f"\nHolding {_sandboxes(count)} up; Ctrl-C tears {them} down.")
     while not interrupts.count:
         time.sleep(0.2)
     if interrupts.count > 1:
         return result
-    click.echo(f"\nTearing down {_sandboxes(count)} (Ctrl-C again to stop now)")
+    _echo(f"\nTearing down {_sandboxes(count)} (Ctrl-C again to stop now)")
     try:
         return result.teardown()
     except RunInterrupted as stopped:
@@ -378,13 +365,13 @@ def _report_teardown(result: BundleRun) -> None:
     still_up = [sandbox for report in reports for sandbox in report.still_up
                 if sandbox.sandbox_type != "local" or LocalSandbox.find_work_dir(sandbox.sandbox_id)]
     if terminated or still_up:
-        click.echo()
+        _echo()
     if terminated:
-        click.echo(f"Tore down {_sandboxes(terminated)}.")
-    if still_up:
-        click.echo(click.style(f"Still up, {_sandboxes(len(still_up))}:", fg="yellow"))
+        _echo(f"Tore down {_sandboxes(terminated)}.")
+    if still_up:  # on stderr, which still reaches the user when stdout is piped away
+        _echo(click.style(f"Still up, {_sandboxes(len(still_up))}:", fg="yellow"), err=True)
         for sandbox in still_up:
-            click.echo(f"  {_still_up(sandbox)}")
+            _echo(f"  {_still_up(sandbox)}", err=True)
 
 
 def _still_up(sandbox: RecordedSandbox) -> str:
