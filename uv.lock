@@ -1,12 +1,12 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11.4"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version < '3.13' and sys_platform != 'win32'",
 ]
 
@@ -107,6 +107,9 @@ gcp = [
 sail = [
     { name = "sail" },
 ]
+smol = [
+    { name = "smolmachines" },
+]
 tenki = [
     { name = "tenki", extra = ["async"] },
 ]
@@ -152,13 +155,14 @@ requires-dist = [
     { name = "requests", marker = "extra == 'gcp'", specifier = ">=2.31" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.10" },
     { name = "sail", marker = "extra == 'sail'", specifier = "~=0.12.8" },
+    { name = "smolmachines", marker = "extra == 'smol'", specifier = ">=1.27.0" },
     { name = "starlette", specifier = ">=0.40" },
     { name = "tenki", extras = ["async"], marker = "extra == 'tenki'", specifier = "~=1.4.1" },
     { name = "tensorlake", marker = "extra == 'tensorlake'", specifier = "~=0.5.140" },
     { name = "uvicorn", specifier = ">=0.47" },
     { name = "uvicorn", marker = "extra == 'explorer'", specifier = ">=0.29" },
 ]
-provides-extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki", "dev"]
+provides-extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki", "dev", "smol"]
 
 [[package]]
 name = "agentenv-framework-protocol"
@@ -3379,8 +3383,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'win32'" },
-    { name = "jeepney", marker = "sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -3412,6 +3416,16 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "smolmachines"
+version = "1.27.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/3f/03155cbfbe98dbe438f16c533de4aafbcb342d835b02b94c7a91ab5f8788/smolmachines-1.27.3-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:9c9942b478c3ef0f7390e0d2af61f3a51f04b2e1e6827e30c30c64d789018756", size = 46019432, upload-time = "2026-10-13T11:23:24.633Z" },
+    { url = "https://files.pythonhosted.org/packages/13/7c/22ce3315a292ad5b1bc86c0c36f524984c39441418e18f9453289d9bf31d/smolmachines-1.27.3-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:6a3722ffc79c85c6b03942187b65a8577d4df405409d4cd96938308915a98e5f", size = 44920156, upload-time = "2026-10-13T11:23:28.392Z" },
+    { url = "https://files.pythonhosted.org/packages/23/b5/198cd322d52e8343b451ab215f38e01c69ecd02f1bbd14db8f90db4af6c3/smolmachines-1.27.3-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:9b446b811f1c1f479f294e8f7e3e19fbc4774392bc52a5a588a53c1cfec52228", size = 46628051, upload-time = "2026-10-13T11:23:31.929Z" },
 ]
 
 [[package]]
