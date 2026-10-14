@@ -89,7 +89,10 @@ def skip_reason(step: "TaskStep", context: TaskStepContext) -> str | None:
 
 
 def record_skip(step: "TaskStep", context: TaskStepContext, reason: str) -> None:
-    context.metadata.setdefault(SKIPPED_STEPS_KEY, []).append({"step_id": step.id, "reason": reason})
+    """Add ``step`` to the run's skips once; a retried dispatch rehydrates a context that may already hold it."""
+    skipped = context.metadata.setdefault(SKIPPED_STEPS_KEY, [])
+    if all(s["step_id"] != step.id for s in skipped):
+        skipped.append({"step_id": step.id, "reason": reason})
 
 
 _WHEN_TRUE = frozenset({"true", "yes", "on", "1"})

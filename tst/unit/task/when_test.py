@@ -10,7 +10,7 @@ from agent_env.task import Task
 from agent_env.task.store import TaskStepStatus, find_task_instance, get_task_store
 from agent_env.task.task import substitute_seed_in_steps
 from agent_env.task_step.context import TaskStepContext
-from agent_env.task_step.task_step import TaskStep, evaluate_when, skip_reason
+from agent_env.task_step.task_step import TaskStep, evaluate_when, record_skip, skip_reason
 
 
 class _Step(TaskStep):
@@ -207,3 +207,13 @@ def test_put_keeps_both_fields(local_stores):
     loaded = TaskStep.get("a")
     assert (saved.when, saved.if_dependency_skipped) == (loaded.when, loaded.if_dependency_skipped) == (
         "<needs_heavy_env>", "run")
+
+
+def test_recording_the_same_skip_twice_keeps_one_entry():
+    ctx = TaskStepContext()
+    step = _step("a", when="false")
+
+    record_skip(step, ctx, "when='false'")
+    record_skip(step, ctx, "when='false'")
+
+    assert ctx.metadata["skipped_steps"] == [{"step_id": "a", "reason": "when='false'"}]
