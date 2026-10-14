@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self
@@ -46,6 +47,45 @@ def attach_retry_config(step: "TaskStep", data: dict[str, Any]) -> "TaskStep":
     if raw is not None and getattr(step, "retry_config", None) is None:
         step.retry_config = RetryConfig.from_dict(raw)
     return step
+
+
+UNFORWARDED_BASE_FIELDS = ("retry_config", "when")
+
+
+def attach_base_fields(step: "TaskStep", data: dict[str, Any]) -> "TaskStep":
+    """Hydrate the base fields step ``__init__``s don't forward (``retry_config``, ``when``)
+    after ``step_cls.from_dict``, so they survive every round-trip. No-op for absent fields."""
+    attach_retry_config(step, data)
+    if data.get("when") is not None and getattr(step, "when", None) is None:
+        step.when = check_when(data["when"])
+    return step
+
+
+_WHEN_TRUE = frozenset({"true", "yes", "on", "1"})
+_WHEN_FALSE = frozenset({"false", "no", "off", "0", ""})
+_UNRESOLVED_PLACEHOLDER = re.compile(r"<[A-Za-z0-9_.-]+>")
+
+
+def check_when(when: Any) -> str | bool:
+    """``when`` as stored: a bool, or a string the run's seed may substitute into one."""
+    if isinstance(when, (bool, str)):
+        return when
+    raise ValueError(f"when is a bool or a string, not {when!r}")
+
+
+def evaluate_when(when: str | bool | None) -> bool:
+    """Whether a step with this ``when`` runs; a skipped step is recorded SKIPPED and unblocks its dependents.
+    None always runs; a string must, after seed substitution, be true/yes/on/1 or false/no/off/0/empty."""
+    if when is None or isinstance(when, bool):
+        return when is not False
+    value = when.strip().lower()
+    if value in _WHEN_TRUE:
+        return True
+    if value in _WHEN_FALSE:
+        return False
+    if _UNRESOLVED_PLACEHOLDER.search(when):
+        raise ValueError(f"when={when!r} still holds a placeholder: the run's seed has no value for it")
+    raise ValueError(f"when={when!r} is not a boolean; use true/yes/on/1 or false/no/off/0")
 
 
 @dataclass
@@ -103,6 +143,7 @@ class TaskStep(ABC):
         depends_on: Optional[list] = None,
         fail_task_on_error: bool = True,
         retry_config: Optional["RetryConfig | dict"] = None,
+        when: Optional[str | bool] = None,
     ):
         self.id = id
         self.version = version
@@ -111,6 +152,7 @@ class TaskStep(ABC):
         if retry_config is not None and not isinstance(retry_config, RetryConfig):
             retry_config = RetryConfig.from_dict(retry_config)
         self.retry_config = retry_config
+        self.when = None if when is None else check_when(when)
 
     @abstractmethod
     async def execute(self, context: TaskStepContext) -> TaskStepContext | None:
@@ -138,6 +180,8 @@ class TaskStep(ABC):
             base["depends_on"] = [dataclasses.asdict(d) for d in self.depends_on]
         if self.retry_config is not None:
             base["retry_config"] = dataclasses.asdict(self.retry_config)
+        if getattr(self, "when", None) is not None:
+            base["when"] = self.when
         return base
 
     @classmethod
@@ -163,13 +207,10 @@ class TaskStep(ABC):
         from .store import get_task_step_store
 
         kwargs.setdefault("version", None)
-        # Most step __init__s don't accept retry_config (it lives on the base but
-        # subclasses don't forward it); construct without it, then hydrate so a
-        # retry_config on any step type round-trips through the step store.
-        retry_config_raw = kwargs.pop("retry_config", None)
-        instance = cls(**kwargs)
-        if retry_config_raw is not None:
-            attach_retry_config(instance, {"retry_config": retry_config_raw})
+        # Most step __init__s don't accept the unforwarded base fields; construct
+        # without them, then hydrate so they round-trip through the step store on any step type.
+        base_fields = {k: kwargs.pop(k) for k in UNFORWARDED_BASE_FIELDS if k in kwargs}
+        instance = attach_base_fields(cls(**kwargs), base_fields)
         return get_task_step_store().put_document(instance)
 
     @classmethod
