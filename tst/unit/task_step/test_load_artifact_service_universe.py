@@ -198,3 +198,41 @@ async def _async_none(*a, **kw):
 class _FakeProvider:
     async def get_sandbox(self, sandbox_id):
         return SimpleNamespace(scoped_name=lambda name: name)
+
+
+class TestSkipIfPreloadedReachesTheLoad:
+    """A flag on the step that never reaches the env would leave every pooled load running."""
+
+    @staticmethod
+    async def _run(monkeypatch, **step_kwargs) -> dict:
+        from agent_env.env.env import Env
+        from agent_env.env.envs.multi_env import MultiEnv
+
+        seen: dict = {}
+
+        class _FakeMultiEnv(MultiEnv):
+            @classmethod
+            async def from_deployed_env(cls, deployed):
+                return cls(id="multi-slack-email", version=1, mcp_server_envs=[])
+
+            async def load_environment_universe_artifact(self, artifact, **kwargs):
+                seen.update(kwargs)
+
+        monkeypatch.setattr(
+            Env, "get",
+            classmethod(lambda cls, id, version=None: _FakeMultiEnv(id=id, version=1, mcp_server_envs=[])),
+        )
+        ctx = TaskStepContext()
+        ctx.deployed_envs = [_deployed_env()]
+        await LoadArtifactTaskStep(
+            id="load", version=None, env_id="multi-slack-email", artifact_id=UNIVERSE_ID, **step_kwargs,
+        ).execute(ctx)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_the_flag_is_passed_to_the_env(self, universe, monkeypatch):
+        assert (await self._run(monkeypatch, skip_if_preloaded=True))["skip_if_preloaded"] is True
+
+    @pytest.mark.asyncio
+    async def test_left_unset_it_loads_as_before(self, universe, monkeypatch):
+        assert (await self._run(monkeypatch))["skip_if_preloaded"] is False

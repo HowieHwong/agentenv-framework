@@ -190,6 +190,7 @@ class DeployedGatewayEnv(DeployedSandboxEnv):
 @dataclass
 class LoadEnvironmentUniverseArtifactResult:
     metadata_filepaths: dict[str, str] = field(default_factory=dict)
+    delivered_preloaded: bool = False
     # Which path the load actually took. A snapshot restore swaps a pre-ingested servicedb
     # image; a miss re-ingests every service over HTTP under a 600s per-service cap. The
     # two are comparable in wall-clock on a well-sized VM (measured ~4min vs ~3.5min on a

@@ -58,7 +58,7 @@ def _env(*, preloaded: dict | None, mode: str = "vm"):
     return env
 
 
-async def _load(env, universe, *, changelog_empty=True, changelog_error=None):
+async def _load(env, universe, *, changelog_empty=True, changelog_error=None, skip_if_preloaded=True):
     """Drive a load with stubbed stores and changelog; returns what it touched."""
     loaded: list[str] = []
     env.load_environment_artifact = AsyncMock(side_effect=lambda a: loaded.append(a.environment_name))
@@ -72,7 +72,9 @@ async def _load(env, universe, *, changelog_empty=True, changelog_error=None):
          patch("agent_env.env.snapshot_store.get_env_snapshot_store", return_value=snapshots), \
          patch("agent_env.env.snapshot_store._check_changelog_empty", changelog), \
          patch("agent_env.env.store.update_env_instance_environment_universe", stamp):
-        result = await env.load_environment_universe_artifact(universe, snapshot_after_load=True)
+        result = await env.load_environment_universe_artifact(
+            universe, snapshot_after_load=True, skip_if_preloaded=skip_if_preloaded,
+        )
     return MagicMock(loaded=loaded, snapshots=snapshots, stamp=stamp, result=result, instances=instances)
 
 
@@ -213,3 +215,18 @@ async def test_a_deployment_with_no_guarantee_writes_nothing():
     run = await _load(_env(preloaded=None), _universe())
 
     run.instances.clear_preloaded_universe.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_without_the_flag_a_preloaded_env_still_loads():
+    """Off by default, so no existing caller's load changes: an explicit load stays a load
+    unless the caller asks to skip."""
+    run = await _load(_env(preloaded={"id": "uni", "version": 39}), _universe(), skip_if_preloaded=False)
+    assert sorted(run.loaded) == sorted(SERVICES)
+    assert run.result.delivered_preloaded is False
+
+
+@pytest.mark.asyncio
+async def test_a_skip_is_reported_on_the_result():
+    run = await _load(_env(preloaded={"id": "uni", "version": 39}), _universe())
+    assert run.result.delivered_preloaded is True

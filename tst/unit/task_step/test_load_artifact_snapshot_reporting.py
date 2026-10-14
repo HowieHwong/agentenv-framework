@@ -99,3 +99,39 @@ def test_a_none_result_records_nothing():
     context = _context()
     LoadArtifactTaskStep._record_universe_load(context, SimpleNamespace(id="uni", version=1), None)
     assert "loaded_environment_universes" not in context.metadata
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_skip_if_preloaded_round_trips(value):
+    restored = LoadArtifactTaskStep.from_dict(_step(skip_if_preloaded=value).to_dict())
+    assert restored.skip_if_preloaded is value
+
+
+def test_skip_if_preloaded_is_off_by_default():
+    """A stored step from before the flag must load exactly as it did."""
+    assert _step().skip_if_preloaded is False
+    assert LoadArtifactTaskStep.from_dict({
+        "id": "load-universe", "version": 1, "env_id": "env-1", "artifact_id": "uni",
+    }).skip_if_preloaded is False
+
+
+def test_records_a_skip_for_a_preloaded_env():
+    context = _context()
+    LoadArtifactTaskStep._record_universe_load(
+        context,
+        SimpleNamespace(id="uni", version=39),
+        SimpleNamespace(restored_from_snapshot=False, snapshot_db_image_artifact_id=None,
+                        snapshot_baked=None, snapshot_bake_error=None, delivered_preloaded=True),
+    )
+    assert context.metadata["loaded_environment_universes"][0]["delivered_preloaded"] is True
+
+
+def test_a_normal_load_records_no_skip():
+    context = _context()
+    LoadArtifactTaskStep._record_universe_load(
+        context,
+        SimpleNamespace(id="uni", version=39),
+        SimpleNamespace(restored_from_snapshot=False, snapshot_db_image_artifact_id=None,
+                        snapshot_baked=None, snapshot_bake_error=None, delivered_preloaded=False),
+    )
+    assert "delivered_preloaded" not in context.metadata["loaded_environment_universes"][0]

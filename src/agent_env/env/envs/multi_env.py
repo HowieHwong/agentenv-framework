@@ -172,6 +172,7 @@ class MultiEnv(Env):
         self,
         environment_universe_artifact: EnvironmentUniverseArtifact,
         snapshot_after_load: bool | None = None,
+        skip_if_preloaded: bool = False,
     ) -> LoadEnvironmentUniverseArtifactResult:
         """Seed this env from a universe artifact, preferring a pre-baked snapshot.
 
@@ -192,6 +193,10 @@ class MultiEnv(Env):
         and pushes a multi-GB servicedb image (~5min, ~2.3GB stored) — worth it to make a
         universe cheap to re-serve, not worth it on a one-off deploy. The bake is
         best-effort and never fails a load that already succeeded.
+
+        ``skip_if_preloaded`` skips the data load for a deployment its provider delivered
+        with this universe already loaded and untouched since (see ``_delivered_with``). It
+        is off by default, so a caller's load always loads unless the caller asks otherwise.
         """
         import uuid
         from agent_env.env.env import LoadEnvironmentUniverseArtifactResult
@@ -212,7 +217,7 @@ class MultiEnv(Env):
         # Keyed on the service images rather than self.id, so re-registering the same
         # servers under a new env id still hits (and a rebuilt server correctly misses).
         env_fingerprint = compute_env_fingerprint(self) if can_restore else None
-        preloaded = await self._delivered_with(environment_universe_artifact)
+        preloaded = skip_if_preloaded and await self._delivered_with(environment_universe_artifact)
         if not preloaded:
             self._void_preloaded_universe()
         snapshot = get_env_snapshot_store().get_clean(
@@ -370,6 +375,7 @@ class MultiEnv(Env):
                 logger.info(f"Successfully downloaded metadata '{key}'")
         return LoadEnvironmentUniverseArtifactResult(
             metadata_filepaths=metadata_filepaths,
+            delivered_preloaded=preloaded,
             restored_from_snapshot=restored_from_snapshot,
             snapshot_db_image_artifact_id=snapshot.db_image_artifact_id if snapshot else None,
             snapshot_baked=snapshot_baked,
