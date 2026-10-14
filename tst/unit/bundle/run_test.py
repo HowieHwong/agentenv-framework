@@ -471,7 +471,7 @@ def test_fail_under_needs_a_bundle_and_changes_nothing_a_dry_run_shows(bundle_di
     bare = CliRunner().invoke(cli, ["run", "--fail-under", "1"])
     dry = CliRunner().invoke(cli, ["run", str(bundle_dir), "--task", "b", "--fail-under", "1", "--dry-run"])
 
-    assert bare.exit_code == 2 and "--fail-under need a BUNDLE to run" in bare.output
+    assert bare.exit_code == 2 and "--fail-under needs a BUNDLE to run" in bare.output
     assert dry.exit_code == 0, dry.output
     assert "Below --fail-under" not in dry.output
 

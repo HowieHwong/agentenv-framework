@@ -10,6 +10,7 @@ import traceback
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 
 from agent_env.bundle import (BundleError, BundleKind, BundleRun, DryRun, Outcome, RunInterrupted, TaskRun,
                               dry_run_bundle, run_bundle)
@@ -26,9 +27,7 @@ _COLORS = {Outcome.PASSED: "green", Outcome.BELOW_ONE: "yellow", Outcome.UNSCORE
 _ENV_ENDPOINTS = (("mcp", "mcp_url"), ("gateway", "gateway_url"), ("pgweb", "db_web_url"), ("db-mcp", "db_mcp_url"),
                   ("vnc", "vnc_url"), ("expires", "expires_at_utc"))
 _DRY_RUN = "Dry run: nothing is written or run."
-# How many of a task's failed criteria the summary names before it counts the rest.
 _SHOWN_CRITERIA = 5
-# How much of a failed criterion's reason fits its summary line.
 _REASON_CHARS = 160
 
 
@@ -69,9 +68,12 @@ def run(ctx: click.Context, bundle: str | None, tasks: tuple[str, ...], evals: t
     exits 130 (143 for SIGTERM); a second one stops the teardown and prints what is still up.
     """
     if bundle is None:
-        if tasks or evals or model or sandbox or keep or dry_run or fail_under is not None:
-            raise click.UsageError("--task, --eval, --model, --sandbox, --keep, --dry-run and --fail-under need a "
-                                   "BUNDLE to run")
+        given = [param.opts[0] for param in ctx.command.params if isinstance(param, click.Option)
+                 and ctx.get_parameter_source(param.name) not in (None, ParameterSource.DEFAULT)]
+        if given:
+            *rest, last = given
+            raise click.UsageError(f"{', '.join(rest)} and {last} need a BUNDLE to run" if rest
+                                   else f"{last} needs a BUNDLE to run")
         _list_installed()
         return
     root, id_root = _locate(bundle)
@@ -98,7 +100,8 @@ def run(ctx: click.Context, bundle: str | None, tasks: tuple[str, ...], evals: t
             result = _hold(result, interrupts)
         _report_teardown(result)
     below = result.below(fail_under) if fail_under is not None else ()
-    _report_below(result, below, fail_under)
+    if below:
+        _report_below(result, below, fail_under)
     if result.failed or below:
         raise SystemExit(1)
 
@@ -114,9 +117,7 @@ def _echo(message: str | None = None, err: bool = False) -> None:
         os.close(devnull)
 
 
-def _report_below(result: BundleRun, below: tuple[TaskRun, ...], threshold: float | None) -> None:
-    if not below:
-        return
+def _report_below(result: BundleRun, below: tuple[TaskRun, ...], threshold: float) -> None:
     shown = ", ".join(f"{result.path(run.entry)} ({min(run.scores.values()):g})" if run.scores
                       else f"{result.path(run.entry)} (no score)" for run in below)
     _echo(f"\nBelow --fail-under {threshold:g}: {shown}")
@@ -203,7 +204,7 @@ def _summarize(result: BundleRun, verbose: bool) -> None:
     _echo("Tasks:")
     for run in result.runs:
         _echo(click.style(f"  {_described(result, run)}", fg=_COLORS[run.outcome]))
-        for line in _failed_criteria(run):
+        for line in _criteria_lines(run):
             _echo(f"    {line}")
     if result.evals:
         _echo("Evals:")
@@ -220,7 +221,7 @@ def _summarize(result: BundleRun, verbose: bool) -> None:
         _print_tracebacks(result)
 
 
-def _failed_criteria(run: TaskRun) -> list[str]:
+def _criteria_lines(run: TaskRun) -> list[str]:
     """A line for each criterion the run failed, its step, the criterion and the reason it gave, up to
     ``_SHOWN_CRITERIA``, then a count of the rest."""
     failed = run.failed_criteria

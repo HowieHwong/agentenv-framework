@@ -42,7 +42,7 @@ def test_the_reason_is_the_first_one_the_verifier_gave():
         {"id": "a", "result": False, "justification": "why", "message": "what", "description": "about"},
         {"id": "b", "result": False, "message": "what", "description": "about"},
         {"id": "c", "result": False, "justification": "  ", "description": "about"},
-        {"type": "response_contains", "result": False}]}}
+        {"type": "response_contains", "id": " ", "result": False}]}}
 
     assert [(criterion.criterion, criterion.reason) for criterion in _failed(verifications)] == [
         ("a", "why"), ("b", "what"), ("c", "about"), ("response_contains #3", "")]
