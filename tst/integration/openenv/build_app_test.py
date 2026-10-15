@@ -24,6 +24,7 @@ from agent_env.artifact import EnvironmentArtifact, FileArtifact
 from agent_env.bundle import BundleError, run_bundle
 from agent_env.env.envs.mcp_server import MCPServerEnv
 from agent_env.openenv import build_app
+from agent_env.store.routing import namespace_routing
 from agent_env.task import Task
 from tst.integration.env.envs.server_env_local_test import VERIFY_CRATE, _docker, _free_port, _put_items_image
 from tst.util.a2a_test_agent import put_test_agent
@@ -221,7 +222,8 @@ async def test_each_session_holds_its_own_deployment_and_every_way_it_ends_tears
         open_at_shutdown = (await held.state())["episode_id"]
 
     assert _left(items.sandboxes) == []
-    assert Task.get_instance(open_at_shutdown).status == "cancelled"
+    with namespace_routing():
+        assert Task.get_instance(open_at_shutdown).status == "cancelled"
 
 
 def test_openenvs_own_validator_runs_against_the_server(items):

@@ -178,7 +178,8 @@ class AgentEnvEnvironment(Environment):
             return _tool_error(name, ToolErrorType.EXECUTION_ERROR, e)
         if result.isError:
             return _tool_error(name, ToolErrorType.EXECUTION_ERROR, result.text)
-        return CallToolObservation(tool_name=name, result={"content": result.content, "is_error": False})
+        return CallToolObservation(tool_name=name, result={
+            "content": result.content, "structured_content": None, "meta": None, "data": result.text, "is_error": False})
 
     async def _end_turn(self, name: str, response: str) -> CallToolObservation:
         await self._turn.end(response)

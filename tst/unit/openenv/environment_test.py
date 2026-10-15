@@ -105,7 +105,9 @@ async def test_an_episode_resets_to_its_turn_steps_through_the_envs_tools_and_is
     assert listed.tools[-1].name == "end_turn"
     called = await _call(env, "add_item", item="crate")
     assert called.error is None
-    assert called.result == {"content": [{"type": "text", "text": "add_item {'item': 'crate'}"}], "is_error": False}
+    assert called.result == {"content": [{"type": "text", "text": "add_item {'item': 'crate'}"}],
+                             "structured_content": None, "meta": None, "data": "add_item {'item': 'crate'}",
+                             "is_error": False}
 
     ended = await _call(env, "end_turn", response=reply)
 
