@@ -101,20 +101,6 @@ def test_a_none_result_records_nothing():
     assert "loaded_environment_universes" not in context.metadata
 
 
-@pytest.mark.parametrize("value", [True, False])
-def test_skip_if_preloaded_round_trips(value):
-    restored = LoadArtifactTaskStep.from_dict(_step(skip_if_preloaded=value).to_dict())
-    assert restored.skip_if_preloaded is value
-
-
-def test_skip_if_preloaded_is_off_by_default():
-    """A stored step from before the flag must load exactly as it did."""
-    assert _step().skip_if_preloaded is False
-    assert LoadArtifactTaskStep.from_dict({
-        "id": "load-universe", "version": 1, "env_id": "env-1", "artifact_id": "uni",
-    }).skip_if_preloaded is False
-
-
 def test_records_a_skip_for_a_preloaded_env():
     context = _context()
     LoadArtifactTaskStep._record_universe_load(

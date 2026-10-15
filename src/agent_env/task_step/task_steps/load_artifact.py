@@ -154,7 +154,6 @@ class LoadArtifactTaskStep(TaskStep):
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         snapshot_after_load: Optional[bool] = None,
-        skip_if_preloaded: bool = False,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         if artifacts is not None and artifact_id is not None:
@@ -210,7 +209,6 @@ class LoadArtifactTaskStep(TaskStep):
         # None = defer to the AGENT_ENV_SNAPSHOT_AFTER_LOAD flag on the worker, so a task
         # doc doesn't hard-code a cost decision an operator may want to flip.
         self.snapshot_after_load = snapshot_after_load
-        self.skip_if_preloaded = skip_if_preloaded
 
     def to_dict(self) -> dict:
         base = super().to_dict()
@@ -225,7 +223,6 @@ class LoadArtifactTaskStep(TaskStep):
         base["sandbox_name"] = self.sandbox_name
         base["container_name"] = self.container_name
         base["snapshot_after_load"] = self.snapshot_after_load
-        base["skip_if_preloaded"] = self.skip_if_preloaded
         return base
 
     @classmethod
@@ -249,7 +246,6 @@ class LoadArtifactTaskStep(TaskStep):
             sandbox_name=data.get("sandbox_name"),
             container_name=data.get("container_name"),
             snapshot_after_load=data.get("snapshot_after_load"),
-            skip_if_preloaded=bool(data.get("skip_if_preloaded", False)),
         )
 
     @staticmethod
@@ -590,8 +586,7 @@ class LoadArtifactTaskStep(TaskStep):
                     # don't accept the kwarg, so don't invent one for them.
                     if isinstance(env, MultiEnv):
                         load_result = await env.load_environment_universe_artifact(
-                            artifact, snapshot_after_load=self.snapshot_after_load,
-                            skip_if_preloaded=self.skip_if_preloaded,
+                            artifact, snapshot_after_load=self.snapshot_after_load
                         )
                     else:
                         load_result = await env.load_environment_universe_artifact(artifact)
