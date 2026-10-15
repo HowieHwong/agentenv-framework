@@ -194,7 +194,8 @@ def _transcript_from_stream_json(rows: list[dict]) -> Transcript:
             elif row.get("type") == "user" and kind == "tool_result" and str(block.get("tool_use_id")) in position:
                 i = position[str(block["tool_use_id"])]
                 body = _decoded(_tool_result_text(block.get("content")))
-                result = {"error": body} if block.get("is_error") else (body or None)
+                # An empty list or object is a real result (a search with no matches); only no text is none.
+                result = {"error": body} if block.get("is_error") else (None if body == "" else body)
                 actions[i] = replace(actions[i], result=result)
     return Transcript(actions, messages)
 
@@ -215,7 +216,9 @@ def _transcript_from_opencode(events: list[dict]) -> Transcript:
             state = part.get("state") if isinstance(part.get("state"), dict) else {}
             args = state.get("input") if isinstance(state.get("input"), dict) else {}
             if state.get("status") == "error":
-                result = {"error": _decoded(state.get("error"))}
+                # OpenCode puts the reason in ``error`` or, for some tools, in ``output``.
+                reason = state.get("error") if state.get("error") not in ("", None) else state.get("output")
+                result = {"error": _decoded(reason)}
             else:
                 result = _decoded(state.get("output")) if state.get("output") not in ("", None) else None
             tool = _HEX_TOOL_PREFIX.sub("", str(part.get("tool") or ""))

@@ -77,6 +77,20 @@ def test_opencode_tool_parts_become_actions_with_output_or_error_and_drop_the_he
     assert t.messages == [FS.AgentMessage(0, "Checking the sheet.")]
 
 
+def test_an_opencode_error_with_its_reason_in_output_keeps_the_reason():
+    raw = json.dumps([_part("p1", "crm_search", {"status": "error", "input": {"name": "x"},
+                                                 "output": "Error: company not found"})])
+    assert FS.transcript_from_raw(raw).actions[0].result == {"error": "Error: company not found"}
+
+
+def test_an_empty_stream_json_result_is_kept_apart_from_no_result():
+    raw = json.dumps([_assistant(_use("t1", "search", {"q": "x"}), _use("t2", "lookup", {"id": 1})),
+                      _user(_res("t1", "[]"), _res("t2", ""))])
+    first, second = FS.transcript_from_raw(raw).actions
+    assert first.result == [] and second.result is None
+    assert "search" in FS.action_log([first]) and "-> []" in FS.action_log([first])
+
+
 def test_unrecognised_lists_still_give_an_empty_transcript():
     for raw in (json.dumps([{"foo": 1}, 3, "x"]), json.dumps([]), json.dumps([{"type": "other"}])):
         assert FS.transcript_from_raw(raw) == FS.Transcript([], [])
