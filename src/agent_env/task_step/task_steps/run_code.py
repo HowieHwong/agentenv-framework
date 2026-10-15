@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 _RUN_DIR = "/tmp/agent_env_run_code"
 
-# The bootstrap we run in the sandbox: `python3 runner.py <run_dir> <entrypoint> <script_file>`.
+# The bootstrap we run in the sandbox: `python3 runner.py <run_dir> <entrypoint> <script_file> <timeout_seconds>`.
 _RUNNER_SOURCE = (Path(__file__).parent / "run_code_runner.py").read_text(encoding="utf-8")
 
 # A universe member with one of these names would shadow run_code's own staging files.
@@ -68,8 +68,9 @@ class RunCodeTaskStep(TaskStep):
     # Not an __init__ default (script_file defaults to None) — the universe entry
     # chosen when several .py members exist.
     ENTRY_WHEN_AMBIGUOUS: ClassVar[str] = "run.py"
-    _TIMEOUT_EXIT_CODE: ClassVar[int] = 124  # `timeout` coreutil convention
-    _STDERR_TRUNCATE: ClassVar[int] = 1000  # max stderr chars surfaced in errors
+    _TIMEOUT_EXIT_CODE: ClassVar[int] = 124  # the runner's status at the limit, after GNU timeout's
+    # The end of a failed script's stderr that its error keeps: the error is stored and raised whole.
+    _STDERR_TAIL_BYTES: ClassVar[int] = 1024 * 1024
     # A collect_artifacts universe can hold hundreds of non-.py members; name a few.
     _SKIPPED_MEMBERS_LOGGED: ClassVar[int] = 10
 
@@ -325,17 +326,16 @@ class RunCodeTaskStep(TaskStep):
         await target.write_file(f"{run_dir}/runner.py", _RUNNER_SOURCE)
 
     async def _run(self, target: _ExecTarget, run_dir: str, script_file: str) -> None:
-        """Run the script under a timeout."""
+        """Run the script, which the runner stops at the timeout."""
         exit_code, _stdout, stderr = await target.run(
-            "timeout", str(self.timeout_seconds),
-            "python3", f"{run_dir}/runner.py", run_dir, self.entrypoint, script_file,
+            "python3", f"{run_dir}/runner.py", run_dir, self.entrypoint, script_file, str(self.timeout_seconds),
         )
         if exit_code == 0:
             return
         reason = (
             f"timed out after {self.timeout_seconds}s"
             if exit_code == self._TIMEOUT_EXIT_CODE
-            else f"exited {exit_code}: {stderr[:self._STDERR_TRUNCATE]}"
+            else f"exited {exit_code}: {self._stderr_tail(stderr)}"
         )
         raise self._exec_error(reason)
 
@@ -348,14 +348,14 @@ class RunCodeTaskStep(TaskStep):
         path = f"{run_dir}/output.json"
         exit_code, size_out, stderr = await target.run("wc", "-c", path)
         if exit_code != 0:
-            raise self._exec_error(f"wrote no result file: {stderr[:self._STDERR_TRUNCATE]}")
+            raise self._exec_error(f"wrote no result file: {self._stderr_tail(stderr)}")
         if int(size_out.split()[0]) > self.MAX_OUTPUT_BYTES:
             raise self._validation_error(
                 f"result exceeds {self.MAX_OUTPUT_BYTES}-byte cap"
             )
         exit_code, stdout, stderr = await target.run("cat", path)
         if exit_code != 0:
-            raise self._exec_error(f"could not read result file: {stderr[:self._STDERR_TRUNCATE]}")
+            raise self._exec_error(f"could not read result file: {self._stderr_tail(stderr)}")
         try:
             return json.loads(stdout)
         except json.JSONDecodeError as exc:
@@ -447,6 +447,14 @@ class RunCodeTaskStep(TaskStep):
         return _AgentTarget(sandbox, prefix)
 
     # --- errors ---
+
+    def _stderr_tail(self, stderr: str) -> str:
+        """``stderr`` within ``_STDERR_TAIL_BYTES``, kept from the end, where the exception is."""
+        data = stderr.encode("utf-8", "replace")
+        if len(data) <= self._STDERR_TAIL_BYTES:
+            return stderr
+        tail = data[-self._STDERR_TAIL_BYTES:].decode("utf-8", "ignore")  # a character cut in two goes
+        return f"[first {len(data) - len(tail.encode('utf-8')):,} bytes of stderr cut]\n{tail}"
 
     def _exec_error(self, msg: str) -> RunCodeExecutionError:
         return RunCodeExecutionError(f"run_code '{self.id}': {msg}")
