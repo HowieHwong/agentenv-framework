@@ -74,12 +74,12 @@ class DeployedEnv:
     # From the card whenever the record carries it (__post_init__); stored because readers of the JSON use them.
     mcp_url: Optional[str] = None
     mcp_server_name: Optional[str] = None
+    preloaded_universe: Optional[dict] = None
     # Set by the registry and the deploy step, never by a provider.
     metadata: Optional[dict] = None
     instance_id: Optional[str] = None
     created_at_utc: Optional[str] = None
     expires_at_utc: Optional[str] = None
-    preloaded_universe: Optional[dict] = None
 
     def __post_init__(self) -> None:
         # Only older records lack their card: they keep the stored values.

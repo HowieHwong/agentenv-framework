@@ -157,6 +157,7 @@ class MultiEnv(Env):
         # A built-in's deploy, or a caller wiring one up by hand, leaves a gateway; a plugin's leaves only its record.
         if self._gateway_url is None and self._deployed is None:
             raise RuntimeError("Environment not deployed - call deploy() first")
+        self._void_preloaded_universe()
         # MCP servers are checked first; if a website shares the same environment_name, the MCP server wins.
         for env in self.mcp_server_envs:
             if env.environment_name == environment_artifact.environment_name:

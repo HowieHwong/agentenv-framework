@@ -230,3 +230,22 @@ async def test_without_the_flag_a_preloaded_env_still_loads():
 async def test_a_skip_is_reported_on_the_result():
     run = await _load(_env(preloaded={"id": "uni", "version": 39}), _universe())
     assert run.result.delivered_preloaded is True
+
+
+@pytest.mark.asyncio
+async def test_loading_a_single_service_voids_the_guarantee():
+    """Reloading one service reinstalls its changelog triggers, emptying its part of the
+    changelog, so a guarantee for A surviving it would skip a load the data needs."""
+    env = _env(preloaded={"id": "uni", "version": 39})
+    gmail = MagicMock(environment_name="gmail", load_environment_artifact=AsyncMock())
+    env.mcp_server_envs = [gmail]
+    instances = MagicMock()
+    with patch("agent_env.env.store.get_env_instance_store", return_value=instances):
+        await env.load_environment_artifact(MagicMock(environment_name="gmail"))
+
+    gmail.load_environment_artifact.assert_awaited_once()
+    instances.clear_preloaded_universe.assert_called_once_with("inst-1")
+    assert env._deployed.preloaded_universe is None
+
+    run = await _load(env, _universe())
+    assert sorted(run.loaded) == sorted(SERVICES)
