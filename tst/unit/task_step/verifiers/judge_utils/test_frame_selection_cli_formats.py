@@ -82,6 +82,16 @@ def test_unrecognised_lists_still_give_an_empty_transcript():
         assert FS.transcript_from_raw(raw) == FS.Transcript([], [])
 
 
+def test_the_transcript_names_its_source_format_and_none_when_unrecognised():
+    assert FS.transcript_from_raw(json.dumps([{"name": "chat", "attributes": {}}])).source == "otel"
+    assert FS.transcript_from_raw(json.dumps([{"type": "system", "subtype": "init"}])).source == "stream-json"
+    assert FS.transcript_from_raw(json.dumps([{"part": {"type": "step-finish"}}])).source == "opencode"
+    assert FS.transcript_from_raw(json.dumps([])).source == "empty"
+    assert FS.transcript_from_raw("not json").source == "malformed"
+    for raw in (json.dumps({"a": 1}), json.dumps([{"foo": 1}, 3]), json.dumps([{"type": "other"}])):
+        assert FS.transcript_from_raw(raw).source is None
+
+
 def test_the_action_log_cuts_args_and_results_at_the_given_widths_and_keeps_the_defaults_otherwise():
     acts = [FS.TrajectoryAction(index=1, tool="docs_write", args={"body": "a" * 500}, screenshot=None,
                                 result="r" * 500)]

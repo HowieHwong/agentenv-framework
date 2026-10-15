@@ -657,3 +657,24 @@ async def test_a_cli_trajectory_reaches_the_direct_judge_as_an_action_log_cut_at
     assert 'agent said: "Closing the ticket."' in text
     assert '1. linear_update_issue {"id": "ENG-1", "state": "Done"} -> "' + "x" * 499 + "…" in text
     assert "x" * 600 not in text and captured["image_blocks"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognised_trajectory_format_fails_the_action_log_instead_of_grading_an_empty_log(monkeypatch):
+    tf = TrajectoryFilter(compaction_type=CompactionType.SCREENSHOT, trajectory_text=TrajectoryText.ACTION_LOG)
+    v = _verifier(output_format=JudgeOutputFormat.RUBRIC_BINARY, grading_policy_prompt=None, trajectory_filter=tf)
+    captured = _capture_judge(monkeypatch, v, _passing_list)
+    monkeypatch.setattr(v, "_read_trajectory_text", lambda uri: json.dumps([{"event": "tool", "name": "x"}]))
+    with pytest.raises(RuntimeError, match="no format the action log reads"):
+        await v.execute(_ctx())
+    assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_trajectory_still_reaches_the_judge_with_an_empty_action_log(monkeypatch):
+    tf = TrajectoryFilter(compaction_type=CompactionType.SCREENSHOT, trajectory_text=TrajectoryText.ACTION_LOG)
+    v = _verifier(output_format=JudgeOutputFormat.RUBRIC_BINARY, grading_policy_prompt=None, trajectory_filter=tf)
+    captured = _capture_judge(monkeypatch, v, _passing_list)
+    monkeypatch.setattr(v, "_read_trajectory_text", lambda uri: "[]")
+    await v.execute(_ctx())
+    assert "eval_prompt" in captured

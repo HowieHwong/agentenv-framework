@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from agent_env.task_step.task_steps.verifiers.judge_utils.trajectory_filter import (
     DEFAULT_ACTION_LOG_MAX_ARGS_CHARS,
@@ -70,10 +70,13 @@ class AgentMessage:
 
 @dataclass(frozen=True)
 class Transcript:
-    """What the RAW trajectory records the agent doing (``actions``) and saying (``messages``)."""
+    """What the RAW trajectory records the agent doing (``actions``) and saying (``messages``). ``source``
+    names the format it was read from (``otel`` / ``stream-json`` / ``opencode``; ``empty`` for an empty
+    list, ``malformed`` for text that is not JSON); None means JSON in no format this module reads."""
 
     actions: list[TrajectoryAction]
     messages: list[AgentMessage]
+    source: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -110,20 +113,23 @@ def _text_blocks(completion: object) -> list[str]:
 def transcript_from_raw(raw_text: str) -> Transcript:
     """The tool calls and agent text of a raw trajectory, in run order. Reads OTel span lists, the
     stream-json rows of coding-agent CLIs (``type`` system / assistant / user / result) and OpenCode event
-    lists (``part.type`` tool / text). Malformed or unrecognised input gives an empty transcript."""
+    lists (``part.type`` tool / text). Malformed or unrecognised input gives an empty transcript; ``source``
+    tells the two apart, and both from a run that recorded nothing."""
     try:
         rows = json.loads(raw_text)
     except (json.JSONDecodeError, TypeError):
-        return Transcript([], [])
+        return Transcript([], [], source="malformed")
     if not isinstance(rows, list):
         return Transcript([], [])
+    if not rows:
+        return Transcript([], [], source="empty")
     dicts = [r for r in rows if isinstance(r, dict)]
     if any(isinstance(r.get("attributes"), dict) for r in dicts):
-        return _transcript_from_otel(dicts)
+        return replace(_transcript_from_otel(dicts), source="otel")
     if any(r.get("type") in _STREAM_JSON_TYPES for r in dicts):
-        return _transcript_from_stream_json(dicts)
+        return replace(_transcript_from_stream_json(dicts), source="stream-json")
     if any(isinstance(r.get("part"), dict) for r in dicts):
-        return _transcript_from_opencode(dicts)
+        return replace(_transcript_from_opencode(dicts), source="opencode")
     return Transcript([], [])
 
 
