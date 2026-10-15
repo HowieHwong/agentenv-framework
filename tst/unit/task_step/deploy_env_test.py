@@ -433,3 +433,65 @@ def test_deployment_settings_keep_their_positions():
     they did: the fifth positional is still ttl_seconds."""
     step = DeployEnvTaskStep("t-1.deploy_env", None, "art-1", 2, 60)
     assert (step.ttl_seconds, step.artifact_id, step.artifact_version) == (60, None, None)
+
+
+def _universe_env(delivers: bool):
+    """A MultiEnv whose provider does or doesn't promise its deploy step's universe."""
+    from types import SimpleNamespace
+
+    from agent_env.env.envs.multi_env import MultiEnv
+
+    env = MagicMock(spec=MultiEnv)
+    env.deploy = AsyncMock(return_value=_deployed_env(None))
+    env._env_provider = SimpleNamespace(delivers_universe=delivers)
+    env.load_environment_universe_artifact = AsyncMock(
+        return_value=SimpleNamespace(restored_from_snapshot=False, delivered_preloaded=True)
+    )
+    return env
+
+
+async def _deploy_with_universe(env, **step_fields):
+    from agent_env.artifact import EnvironmentUniverseArtifact
+
+    universe = MagicMock(spec=EnvironmentUniverseArtifact, id="u", version=3)
+    step = DeployEnvTaskStep(id="t-1.deploy_env", version=None, env_id="art-1", env_version=2,
+                             **step_fields)
+    context = TaskStepContext()
+    with patch("agent_env.env.env.Env") as Env, patch("agent_env.artifact.Artifact.get",
+                                                      return_value=universe):
+        Env.get.return_value = env
+        await step.execute(context)
+    return universe, context
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_delivers_universes_gets_its_universe_loaded_on_deploy():
+    """deploy_env naming a universe is a contract for such a provider: hit or miss, the env
+    holds it afterwards, so its task needs no load_artifact. The load is skipped when the
+    env arrived with it, and recorded as load_artifact records it."""
+    env = _universe_env(delivers=True)
+
+    universe, context = await _deploy_with_universe(env, artifact_id="u", artifact_version=3)
+
+    env.load_environment_universe_artifact.assert_awaited_once_with(universe, skip_if_preloaded=True)
+    assert context.metadata["loaded_environment_universes"] == [
+        {"id": "u", "version": 3, "restored_from_snapshot": False, "delivered_preloaded": True}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_other_provider_leaves_loading_to_load_artifact():
+    env = _universe_env(delivers=False)
+
+    await _deploy_with_universe(env, artifact_id="u", artifact_version=3)
+
+    env.load_environment_universe_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_naming_no_universe_loads_nothing():
+    env = _universe_env(delivers=True)
+
+    await _deploy_with_universe(env)
+
+    env.load_environment_universe_artifact.assert_not_awaited()

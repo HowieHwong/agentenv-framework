@@ -120,6 +120,29 @@ class DeployEnvTaskStep(TaskStep):
             return [f"deploy_env '{self.id}': env '{self.env_id}' can't be loaded: {e}"]
         return [f"deploy_env '{self.id}': {refusal}"] if refusal else []
 
+    async def _load_delivered_universe(self, env, context: TaskStepContext) -> None:
+        """Load this step's universe when the env's provider promises a loaded env.
+
+        Such a provider (``delivers_universe``) makes deploy_env with an artifact a contract:
+        the env has that universe whether the provider handed over one already holding it or
+        built one cold. Its task carries no load_artifact step, so the load happens here,
+        skipped when the env arrived with this universe untouched, and is recorded the way
+        load_artifact records it. Every other provider leaves loading to load_artifact.
+        """
+        from agent_env.artifact import Artifact, EnvironmentUniverseArtifact
+        from agent_env.env.envs.multi_env import MultiEnv
+        from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
+
+        if self.artifact_id is None or not isinstance(env, MultiEnv):
+            return
+        if not getattr(getattr(env, "_env_provider", None), "delivers_universe", False):
+            return
+        artifact = Artifact.get(self.artifact_id, self.artifact_version)
+        if not isinstance(artifact, EnvironmentUniverseArtifact):
+            return
+        load_result = await env.load_environment_universe_artifact(artifact, skip_if_preloaded=True)
+        LoadArtifactTaskStep._record_universe_load(context, artifact, load_result)
+
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.env.env import Env
 
@@ -180,6 +203,7 @@ class DeployEnvTaskStep(TaskStep):
         if deployed_env.instance_id:
             update_env_instance_metadata(deployed_env.instance_id, annotations)
         context.deployed_envs.append(deployed_env)
+        await self._load_delivered_universe(env, context)
 
         # Some envs (e.g. harbor coding tasks) build + run the agent as part of
         # deploy() and have no separate DeployAgent step. They advertise the

@@ -33,6 +33,10 @@ class EnvironmentProvider(ABC):
     """Deploys an env and hands back its record; tears down what it created."""
 
     type: ClassVar[str]  # the name an env declares it by, and that its records carry as env_provider_type
+    # True for a provider that promises the deploy step's universe is loaded once deploy_env
+    # finishes, hit or miss: the step then loads it unless the provider delivered it, so a
+    # task needs no load_artifact step. Off for every built-in provider.
+    delivers_universe: ClassVar[bool] = False
 
     @abstractmethod
     async def deploy(self, env: Env, sandbox_provider: SandboxProvider) -> DeployedEnv:
