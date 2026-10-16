@@ -114,7 +114,7 @@ async def test_a_bundle_task_played_by_openenvs_clients_scores_as_agent_env_run_
 
     with _serving(app) as url:
         async with httpx.AsyncClient(base_url=url) as http:
-            assert [split["name"] for split in (await http.get("/dock/splits")).json()] == ["smoke", "all"]
+            assert [split["name"] for split in (await http.get("/dock/splits")).json()] == ["all", "smoke"]
             task = (await http.post("/dock/task", json={"split": "all", "index": 0})).json()["task"]
         assert (task["name"], task["prompt"], task["system_prompt"], task["agent"]) == (
             "crate", "Add a crate.", "You keep the items.", "policy")
