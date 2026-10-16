@@ -8,7 +8,7 @@ from agent_env.task.episode.rules import problems
 from agent_env.task.episode.run import Episode, EpisodeError
 from agent_env.task.episode.steps import _EpisodeAgentStep, _EpisodeTurnStep
 from agent_env.task.task import Task, substitute_seed_in_steps
-from agent_env.task_step.context import TaskStepContext
+from agent_env.task_step.context import TaskStepContext, sandbox_overrides
 from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
 
@@ -58,7 +58,7 @@ class EpisodeSpec:
         if self._seed:
             metadata["seed"] = dict(self._seed)
         if sandbox:
-            metadata["user_overrides"] = {"env_sandbox": sandbox, "agent_sandbox": sandbox, "sandbox": sandbox}
+            metadata["user_overrides"] = sandbox_overrides(sandbox)
         episode = Episode(episode_id, self._copy, TaskStepContext(metadata=metadata))
         await episode._launch()
         return episode

@@ -31,7 +31,7 @@ from agent_env.task import Task, record_task_cancelled
 from agent_env.task.interrupts import Interrupts
 from agent_env.task.task import recorded_scores
 from agent_env.task.teardown import TeardownReport, teardown_run
-from agent_env.task_step.context import TaskStepContext
+from agent_env.task_step.context import TaskStepContext, sandbox_overrides
 from agent_env.utils.docker_build import DEFAULT_BUILD_PLATFORM
 
 from ._fs import relative
@@ -390,7 +390,7 @@ async def _run_all(
         tag = f"[{_path(plan, entry)}]"
         metadata = {"run_group_id": run_group_id, "task_id": task.id}
         if sandbox:
-            metadata["user_overrides"] = {"env_sandbox": sandbox, "agent_sandbox": sandbox, "sandbox": sandbox}
+            metadata["user_overrides"] = sandbox_overrides(sandbox)
         context = TaskStepContext(metadata=metadata)
         try:
             await semaphore.acquire()
