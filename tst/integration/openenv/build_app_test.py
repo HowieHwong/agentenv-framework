@@ -235,7 +235,8 @@ def test_openenvs_own_validator_runs_against_the_server(items):
                                  "runtime", "--json", "--timeout", "300"], capture_output=True, text=True, timeout=900)
 
     findings = json.loads(report.stdout)
-    assert (report.returncode, findings["passed"], findings["failed_criteria"]) == (0, True, []), report.stdout
+    assert (report.returncode, findings["passed"], findings["summary"]["failed_criteria"]) == (0, True, []), (
+        report.stdout)
 
 
 def test_a_bundle_naming_an_env_the_store_doesnt_hold_is_refused_at_startup(items):
