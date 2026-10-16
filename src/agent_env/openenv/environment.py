@@ -108,8 +108,8 @@ class AgentEnvEnvironment(Environment):
 
     async def reset_async(self, seed: int | None = None, episode_id: str | None = None, *, split: str | None = None,
                           index: int | None = None, **kwargs: Any) -> Observation:
-        """Plays task ``index`` of ``split``, or the first split's first task without either, as OpenEnv's ORS and
-        verifiers importers do."""
+        """Plays task ``index`` of ``split``, or without either the first task served, as OpenEnv's ORS and verifiers
+        importers do."""
         async with self._lock:
             return await self._reset(split, index)
 
@@ -118,9 +118,9 @@ class AgentEnvEnvironment(Environment):
         self._loop = asyncio.get_running_loop()
         self._done, self._served_task, self._state = False, None, State(episode_id=None, step_count=0)
         if (split is None) != (index is None):
-            return self._ended("split and index go together: give both, or neither for the first split's first task")
+            return self._ended("split and index go together: give both, or neither for the first task served")
         if split is None:
-            split, index = next(iter(self._served.splits)), 0
+            split, index = next(name for name, tasks in self._served.splits.items() if tasks), 0
         try:
             self._served_task = self._task_at(split, index)
         except IndexError as e:
@@ -240,9 +240,12 @@ class AgentEnvEnvironment(Environment):
             raise EpisodeError(f"the env offers tools OpenEnv reserves: {', '.join(clash)}")
 
     async def _ended_episode(self) -> dict[str, Any] | None:
-        """The error metadata a step answers with once the episode can't go on: it has ended, or its run has."""
+        """The error metadata a step answers with once the episode can't go on: it has ended, its run has, or the call
+        opening its turn was cancelled."""
         if self._done or self._episode is None:
             return {"status": "error", "error": ENDED, "task": self._task_metadata()}
+        if self._tools is None:
+            return (await self._fail("the call opening the episode's turn was cancelled")).metadata
         if not self._episode.finished:
             return None
         try:

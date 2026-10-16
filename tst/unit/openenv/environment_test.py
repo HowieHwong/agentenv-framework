@@ -223,8 +223,12 @@ async def test_a_split_or_index_with_no_task_or_one_without_the_other_is_an_erro
     assert (await env.reset_async(split="all", index=1)).metadata["error"] == (
         "split 'all' has 1 tasks, so it has no task 1")
     assert (await env.reset_async(index=0)).metadata["error"] == (
-        "split and index go together: give both, or neither for the first split's first task")
+        "split and index go together: give both, or neither for the first task served")
     assert teardowns.started == []
+
+    env._served.splits = {"refused": (), **env._served.splits}
+    assert (await env.reset_async()).metadata["task"]["split"] == "all"
+    await asyncio.to_thread(env.close)
 
 
 @pytest.mark.asyncio
@@ -260,6 +264,24 @@ async def test_calls_that_overlap_on_one_session_take_turns_as_openenvs_http_ses
 
     assert (await ending).reward == 1.0
     assert (await calling).metadata["error"] == ENDED
+
+
+@pytest.mark.asyncio
+async def test_an_end_turn_cancelled_before_the_next_turn_opens_ends_the_episode_at_the_next_step(teardowns, tools):
+    between = {"id": "between", "type": "episode_test_gate", "depends_on": ["turn"]}
+    env = _env(ITEMS, ALICE, TURN, between, {**AGAIN, "depends_on": ["between"]}, REPLIES)
+    await env.reset_async()
+    ending = asyncio.create_task(_call(env, "end_turn", response="Added a crate."))
+    await asyncio.sleep(0.05)
+    ending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await ending
+
+    listed = await env.step_async(ListToolsAction())
+
+    assert (listed.done, listed.metadata["status"], listed.metadata["error"]) == (
+        True, "error", "the call opening the episode's turn was cancelled")
+    assert (Task.get_instance(env.state.episode_id).status, teardowns.finished) == ("cancelled", [env.state.episode_id])
 
 
 @pytest.mark.asyncio
