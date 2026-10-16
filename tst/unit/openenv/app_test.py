@@ -1,11 +1,14 @@
 """``build_app`` over bundle folders, served in process: the splits it serves and the tasks it leaves out, the reward
-it refuses, an episode played over OpenEnv's own WebSocket, and namespace routing for the app's life."""
+and bundles it refuses, an episode played over OpenEnv's own WebSocket, and namespace routing for each of the app's
+runs."""
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from agent_env.bundle import BundleError
 from agent_env.openenv import build_app
@@ -38,14 +41,14 @@ def _tasks(client, name, split):
     return [task["name"] for task in response.json()["tasks"]]
 
 
-def test_each_eval_is_a_split_beside_all_and_a_task_that_cant_be_played_is_left_out(bundles, caplog):
+def test_all_and_each_eval_are_splits_and_a_task_that_cant_be_played_is_left_out(bundles, caplog):
     root = bundles("dock", {"tasks/a.json": PLAYED, "tasks/b.json": PLAYED, "tasks/wiring.json": WIRING,
                             "evals/smoke.toml": 'tasks = ["a", "wiring"]\n'})
     with caplog.at_level(logging.WARNING, logger="agent_env.openenv.app"):
         app = build_app(str(root))
 
     with TestClient(app) as client:
-        assert [split["name"] for split in client.get("/dock/splits").json()] == ["smoke", "all"]
+        assert [split["name"] for split in client.get("/dock/splits").json()] == ["all", "smoke"]
         assert (_tasks(client, "dock", "smoke"), _tasks(client, "dock", "all")) == (["a"], ["a", "b"])
         task = client.post("/dock/task", json={"split": "all", "index": 1}).json()["task"]
     assert (task["prompt"], task["system_prompt"], task["agent"]) == ("Add a crate.", "You keep the items.", "alice")
@@ -65,7 +68,10 @@ def test_a_mapping_serves_each_bundle_as_its_split(bundles):
 def test_an_episode_is_played_over_openenvs_websocket_and_the_session_closing_tears_it_down(bundles):
     root = bundles("dock", {"tasks/a.json": PLAYED})
 
-    with TestClient(build_app(str(root))) as client:
+    app = build_app(str(root))
+    assert not namespace_routing_enabled()
+
+    with TestClient(app) as client:
         assert namespace_routing_enabled()
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"type": "reset", "data": {"split": "all", "index": 0}})
@@ -83,6 +89,9 @@ def test_an_episode_is_played_over_openenvs_websocket_and_the_session_closing_te
     assert not namespace_routing_enabled()
     with namespace_routing():
         assert Task.get_instance(open_episode).status == "cancelled"
+    with TestClient(app):
+        assert namespace_routing_enabled()
+    assert not namespace_routing_enabled()
 
 
 @pytest.mark.parametrize(("reward", "message"), [
@@ -96,10 +105,32 @@ def test_a_reward_that_cant_score_every_task_is_refused(bundles, reward, message
         build_app(str(root), reward=reward)
     with TestClient(build_app(str(root), reward="again")):
         pass
+    with pytest.raises(ValidationError, match="max_concurrent_envs"):
+        build_app(str(root), reward="again", max_concurrent_envs=0)
 
 
-def test_a_bundle_with_no_task_to_play_is_refused_with_why(bundles):
+def test_a_bundle_with_no_task_to_play_or_an_eval_named_all_is_refused_with_why(bundles):
     root = bundles("dock", {"tasks/wiring.json": WIRING})
+    named_all = bundles("named-all", {"tasks/a.json": PLAYED, "tasks/b.json": PLAYED, "evals/all.toml": 'tasks = ["a"]\n'})
 
     with pytest.raises(BundleError, match="no task can be served as an OpenEnv env: task '@local/~/dock/wiring'"):
         build_app(str(root))
+    with pytest.raises(BundleError, match="eval 'all' has the name of the split that holds every task"):
+        build_app(str(named_all))
+
+
+def test_a_path_is_a_folder_even_where_an_installed_bundle_has_its_name(bundles, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(BundleError, match="hello"):
+        build_app(Path("hello"))
+
+
+def test_a_dotted_bundle_name_is_served_dashed_as_openenvs_web_interface_reads_a_name_as_a_module(
+        bundles, monkeypatch):
+    monkeypatch.setenv("ENABLE_WEB_INTERFACE", "true")
+    monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "false")
+    root = bundles("dock.v1", {"tasks/a.json": PLAYED})
+
+    with TestClient(build_app(root)) as client:
+        assert [split["name"] for split in client.get("/dock-v1/splits").json()] == ["all"]

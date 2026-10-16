@@ -33,26 +33,26 @@ def build_app(
     max_concurrent_envs: int = 8,
 ) -> FastAPI:
     """The OpenEnv server for ``bundle``'s tasks: a folder or an installed bundle's name, as ``agent-env run BUNDLE``
-    reads it, whose evals are splits beside ``all``; or a mapping of split name to bundle. Each session plays one
-    episode of a task at a time, deploying where ``sandbox`` names, as ``agent-env run --sandbox`` does.
+    reads it, served as the split ``all`` and a split per eval; or a mapping of split name to bundle. Each session
+    plays one episode of a task at a time, deploying where ``sandbox`` names, as ``agent-env run --sandbox`` does.
 
     ``reward`` makes the reward of a task's scores: a step id, or a function of the scores by step id; without it a
     task that records one score has that one. Each bundle is prepared as ``agent-env run`` prepares it before its
-    first task, without the agent a client plays, and a task that can't run as an episode is left out and logged.
-    Namespace routing stays on until the app shuts down, when every open episode is torn down. Raises BundleError
-    when a bundle can't be prepared or serves no task, and ValueError when ``reward`` can't score every task."""
-    routing = ExitStack()
-    routing.enter_context(namespace_routing())
-    try:
+    first task, without the agent a client plays, so every task must pass its checks; one that can't run as an
+    episode is then left out and logged. Namespace routing is on from the app's startup to its shutdown, which tears
+    down every open episode. Raises BundleError when a bundle can't be prepared or serves no task, and ValueError
+    when ``reward`` can't score every task."""
+    with namespace_routing():
         prepared = {split: _prepared(source, sandbox) for split, source in _sources(bundle).items()}
         served = Served(splits=_served(_splits(bundle, prepared), reward),
                         reward=reward if callable(reward) else None, sandbox=sandbox)
-    except BaseException:
-        routing.close()
-        raise
-    names = "+".join(dict.fromkeys(each.plan.bundle.bundle.name for each in prepared.values()))
     app = create_app(functools.partial(AgentEnvEnvironment, served), CallToolAction, CallToolObservation,
-                     env_name=names, max_concurrent_envs=max_concurrent_envs, reset_observation_cls=Observation)
+                     env_name=_env_name(prepared), max_concurrent_envs=max_concurrent_envs,
+                     reset_observation_cls=Observation)
+    routing = ExitStack()
+
+    async def route() -> None:
+        routing.enter_context(namespace_routing())
 
     async def tear_down() -> None:
         try:
@@ -60,6 +60,7 @@ def build_app(
         finally:
             routing.close()
 
+    app.router.on_startup.append(route)
     app.router.on_shutdown.append(tear_down)
     return app
 
@@ -70,7 +71,7 @@ def _sources(bundle: _Source | Mapping[str, _Source]) -> dict[str | None, _Sourc
 
 def _prepared(source: _Source, sandbox: str | None) -> PreparedBundle:
     """``source`` prepared with every task and eval selected, so ``all`` holds every task, evals or not."""
-    root, id_root = locate_bundle(str(source))
+    root, id_root = (source, None) if isinstance(source, Path) else locate_bundle(source)
     entries = parse_bundle(Path(root), id_root=id_root).entries
     return prepare_bundle(
         root, tasks=[entry.name for entry in entries if entry.kind is BundleKind.TASK],
@@ -83,10 +84,18 @@ def _splits(bundle: _Source | Mapping[str, _Source],
     if isinstance(bundle, Mapping):
         return {split: [(entry.name, task) for entry, task in each.tasks] for split, each in prepared.items()}
     [only] = prepared.values()
+    if any(entry.entry.name == "all" for entry in only.plan.evals):
+        raise BundleError(["eval 'all' has the name of the split that holds every task; rename it, or serve a "
+                           "mapping of split name to bundle"])
     tasks = [(entry.name, task) for entry, task in only.tasks]
     named = {task.id: (name, task) for name, task in tasks}
-    return {**{entry.entry.name: [named[ref.id] for ref in entry.references] for entry in only.plan.evals},
-            "all": tasks}
+    return {"all": tasks,
+            **{entry.entry.name: [named[ref.id] for ref in entry.references] for entry in only.plan.evals}}
+
+
+def _env_name(prepared: dict[str | None, PreparedBundle]) -> str:
+    """The bundles' names, with no ``.``: OpenEnv's web interface reads the env's name as a module path."""
+    return "+".join(dict.fromkeys(each.plan.bundle.bundle.name for each in prepared.values())).replace(".", "-")
 
 
 def _served(splits: dict[str, list[tuple[str, Task]]],

@@ -1,5 +1,6 @@
 """A bundle task as an OpenEnv env, on the Episode API's fake steps: the Task API, an episode reset, stepped and scored,
-its tool errors, every way it ends in an error observation, and how a session's episode is torn down."""
+its tool errors, every way it ends in an error observation, calls that overlap, and how a session's episode is torn
+down."""
 
 import asyncio
 
@@ -11,23 +12,25 @@ from openenv.core.env_server.mcp_types import CallToolAction, ListToolsAction, T
 import agent_env.task.episode.run as episode_run
 from agent_env.openenv.environment import ENDED, AgentEnvEnvironment, Served, ServedTask
 from agent_env.task import EpisodeSpec, Task
-from tst.unit.task.episode.run_test import ALICE, ITEMS, REPLIES, TURN
+from tst.unit.task.episode.run_test import ALICE, ITEMS, REPLIES, TURN, _gate
 
 AGAIN = {**TURN, "id": "again", "prompt_id": "again", "prompt": "Add another.", "depends_on": ["turn"]}
 
 
 class _Tools:
     """Stands in for ``ToolSession``: every env offers ``offered``, and a call answers with what ``answers`` maps
-    its tool to, raising it when it's an exception."""
+    its tool to, raising it when it's an exception. A session opens once ``release`` is set, when there is one."""
 
     def __init__(self, offered, answers):
-        self.offered, self.answers, self.closed = offered, answers, 0
+        self.offered, self.answers, self.closed, self.release = offered, answers, 0, None
 
     def __call__(self, *, mcp_url, role, headers, timeout):
         tools = self
 
         class _Session:
             async def open(self):
+                if tools.release is not None:
+                    await tools.release.wait()
                 return self
 
             async def list_tools(self):
@@ -87,7 +90,8 @@ async def test_the_task_api_lists_each_split_with_each_tasks_prompt_and_agent(te
         env.get_task("all", 3)
     with pytest.raises(IndexError, match="there is no split 'train'; the splits are smoke, all"):
         env.num_tasks("train")
-    env.close()
+    assert (await env.reset_async()).metadata["task"] == {"id": "dock-0", "name": "dock-0", "split": "smoke", "index": 0}
+    await asyncio.to_thread(env.close)
 
 
 @pytest.mark.asyncio
@@ -211,12 +215,15 @@ async def test_an_env_offering_a_name_openenv_reserves_is_refused_at_reset_and_t
 
 
 @pytest.mark.asyncio
-async def test_a_split_or_index_with_no_task_is_an_error_observation(teardowns, tools):
+async def test_a_split_or_index_with_no_task_or_one_without_the_other_is_an_error_observation(teardowns, tools):
     env = _env(ITEMS, ALICE, TURN, REPLIES)
 
-    assert (await env.reset_async(split="train")).metadata["error"] == (
+    assert (await env.reset_async(split="train", index=0)).metadata["error"] == (
         "there is no split 'train'; the splits are all")
-    assert (await env.reset_async(index=1)).metadata["error"] == "split 'all' has 1 tasks, so it has no task 1"
+    assert (await env.reset_async(split="all", index=1)).metadata["error"] == (
+        "split 'all' has 1 tasks, so it has no task 1")
+    assert (await env.reset_async(index=0)).metadata["error"] == (
+        "split and index go together: give both, or neither for the first split's first task")
     assert teardowns.started == []
 
 
@@ -231,6 +238,50 @@ async def test_a_reset_on_a_live_session_cancels_and_tears_down_its_episode_firs
     assert (Task.get_instance(first).status, Task.get_instance(first).error) == ("cancelled", "reset")
     assert teardowns.finished == [first]
     assert (await _call(env, "end_turn", response="Added.")).reward == 1.0
+
+
+@pytest.mark.asyncio
+async def test_calls_that_overlap_on_one_session_take_turns_as_openenvs_http_sessions_can_overlap_them(
+        teardowns, tools):
+    up, judge = {"id": "up", "type": "episode_test_gate"}, {"id": "judge", "type": "episode_test_gate"}
+    env = _env(ITEMS, up, {**ALICE, "depends_on": ["items", "up"]}, TURN, {**judge, "depends_on": ["turn"]},
+               {**REPLIES, "depends_on": ["judge"]})
+    resetting = asyncio.create_task(env.reset_async())
+    listing = asyncio.create_task(env.step_async(ListToolsAction()))
+    await asyncio.sleep(0.05)
+    _gate("up").set()
+    await resetting
+    assert [tool.name for tool in (await listing).tools] == ["add_item", "end_turn"]
+
+    ending = asyncio.create_task(_call(env, "end_turn", response="Added."))
+    calling = asyncio.create_task(_call(env, "add_item"))
+    await asyncio.sleep(0.05)
+    _gate("judge").set()
+
+    assert (await ending).reward == 1.0
+    assert (await calling).metadata["error"] == ENDED
+
+
+@pytest.mark.asyncio
+async def test_a_session_closed_while_its_turn_opens_is_torn_down_with_the_turns_tools_once_it_has_opened(
+        teardowns, tools):
+    sessions = tools()
+    sessions.release = asyncio.Event()
+    env = _env(ITEMS, ALICE, TURN, REPLIES)
+    resetting = asyncio.create_task(env.reset_async())
+    async with asyncio.timeout(5):
+        while env._stack is None:
+            await asyncio.sleep(0.01)
+
+    closing = asyncio.create_task(asyncio.to_thread(env.close))
+    await asyncio.sleep(0.05)
+    sessions.release.set()
+    await resetting
+    await closing
+
+    assert sessions.closed == 1
+    assert (Task.get_instance(env.state.episode_id).status, teardowns.finished) == ("cancelled", [env.state.episode_id])
+    assert (await env.step_async(ListToolsAction())).metadata["error"] == ENDED
 
 
 @pytest.mark.asyncio

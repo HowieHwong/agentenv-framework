@@ -59,7 +59,7 @@ class Served:
     ending: set[asyncio.Task] = field(default_factory=set)
 
     async def close(self, reason: str) -> None:
-        await asyncio.gather(*(env._end(reason) for env in list(self.live)), *self.ending)
+        await asyncio.gather(*(env._close(reason) for env in list(self.live)), *self.ending)
 
     def end_later(self, ending: Coroutine[Any, Any, None]) -> asyncio.Task:
         task = asyncio.ensure_future(ending)
@@ -69,11 +69,15 @@ class Served:
 
 
 class AgentEnvEnvironment(Environment):
+    """Reset, step and close take turns: OpenEnv's HTTP MCP sessions and its web playground can call one env
+    concurrently."""
+
     SUPPORTS_CONCURRENT_SESSIONS = True
 
     def __init__(self, served: Served):
         super().__init__()
         self._served = served
+        self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._served_task: ServedTask | None = None
         self._episode: Episode | None = None
@@ -102,11 +106,21 @@ class AgentEnvEnvironment(Environment):
 
     # The episode
 
-    async def reset_async(self, seed: int | None = None, episode_id: str | None = None, *, split: str = "all",
-                          index: int = 0, **kwargs: Any) -> Observation:
+    async def reset_async(self, seed: int | None = None, episode_id: str | None = None, *, split: str | None = None,
+                          index: int | None = None, **kwargs: Any) -> Observation:
+        """Plays task ``index`` of ``split``, or the first split's first task without either, as OpenEnv's ORS and
+        verifiers importers do."""
+        async with self._lock:
+            return await self._reset(split, index)
+
+    async def _reset(self, split: str | None, index: int | None) -> Observation:
         await self._end("reset")
         self._loop = asyncio.get_running_loop()
         self._done, self._served_task, self._state = False, None, State(episode_id=None, step_count=0)
+        if (split is None) != (index is None):
+            return self._ended("split and index go together: give both, or neither for the first split's first task")
+        if split is None:
+            split, index = next(iter(self._served.splits)), 0
         try:
             self._served_task = self._task_at(split, index)
         except IndexError as e:
@@ -130,6 +144,10 @@ class AgentEnvEnvironment(Environment):
         raise NotImplementedError("an AgentEnv episode runs on the server's event loop: reset_async")
 
     async def step_async(self, action: Any, timeout_s: float | None = None, **kwargs: Any) -> Observation:
+        async with self._lock:
+            return await self._step(action, timeout_s)
+
+    async def _step(self, action: Any, timeout_s: float | None) -> Observation:
         if isinstance(action, ListToolsAction):
             if (ended := await self._ended_episode()) is not None:
                 return ListToolsObservation(tools=[], done=True, reward=None, metadata=ended)
@@ -163,9 +181,9 @@ class AgentEnvEnvironment(Environment):
         except RuntimeError:
             running = None
         if running is self._loop:
-            self._served.end_later(self._end("the session closed"))
+            self._served.end_later(self._close("the session closed"))
         else:
-            asyncio.run_coroutine_threadsafe(self._end("the session closed"), self._loop).result()
+            asyncio.run_coroutine_threadsafe(self._close("the session closed"), self._loop).result()
 
     async def _call(self, action: CallToolAction, timeout_s: float | None) -> CallToolObservation:
         name = action.tool_name
@@ -247,9 +265,13 @@ class AgentEnvEnvironment(Environment):
         self._done = True
         self._state.done = True
 
+    async def _close(self, reason: str) -> None:
+        async with self._lock:
+            await self._end(reason)
+
     async def _end(self, reason: str) -> None:
-        """Abandon the episode and close the turn's tools, waiting for the teardown. The abandon is tracked before
-        anything is awaited, so a server shutting down meanwhile waits for it too."""
+        """Abandon the episode and close the turn's tools, waiting for the teardown; the caller holds the lock. The
+        abandon is tracked before anything is awaited, so a server shutting down meanwhile waits for it too."""
         episode, self._episode = self._episode, None
         abandoning = self._served.end_later(episode.abandon(reason)) if episode is not None else None
         self._served.live.discard(self)
