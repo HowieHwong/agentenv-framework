@@ -109,7 +109,7 @@ and deserialized through a registry.
 | `bundle/` | A bundle is a folder of entities (`envs/`, `agents/`, `artifacts/`, `skills/`, `tasks/<name>.json`, `evals/<name>.toml`) that runs without a registry: `agent-env run` plans it, writes it into the `@local` namespace (reusing each version whose inputs haven't changed) and runs its evals or tasks; `agent-env bundle init` writes a stored task or eval as one, with its references pinned. |
 | `eval/` | `Eval` (`eval`), a versioned list of task references, and its store. |
 | `plugins/` | Entry-point plugins (see Extension points): the group names, `inventory()`, which `agent-env plugin list/show/check` report, `load_failures` and `settings`. The top level is public; the underscored modules are internal. |
-| `explorer/` | Optional local web UI: `agent-env up`, needs the `explorer` extra, binds loopback `:8234`. |
+| `explorer/` | Optional local web UI: `agent-env up`, binds loopback `:8234`. |
 | `cli/` | Click CLI with the groups `a2a-agent`, `artifact`, `bundle`, `config`, `env`, `eval`, `plugin`, `run`, `task`, `up`. |
 | `examples/` | The bundles agent-env ships (`hello`, and `echo-mcp`, which needs Docker), registered under `agent_env.bundles` in `pyproject.toml`. Tests run them, but they are examples for users, not fixtures. |
 

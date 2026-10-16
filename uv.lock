@@ -76,7 +76,6 @@ dev = [
     { name = "anyio" },
     { name = "boto3" },
     { name = "botocore" },
-    { name = "fastapi" },
     { name = "fastmcp" },
     { name = "google-api-core" },
     { name = "google-auth" },
@@ -97,12 +96,7 @@ dev = [
     { name = "sail" },
     { name = "tenki", extra = ["async"] },
     { name = "tensorlake" },
-    { name = "uvicorn" },
     { name = "vercel-sandbox" },
-]
-explorer = [
-    { name = "fastapi" },
-    { name = "uvicorn" },
 ]
 gcp = [
     { name = "google-api-core" },
@@ -132,7 +126,7 @@ vercel = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", specifier = "==0.3.26" },
-    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki", "vercel"], marker = "extra == 'dev'" },
+    { name = "agentenv-framework", extras = ["aws", "gcp", "sail", "tensorlake", "tenki", "vercel"], marker = "extra == 'dev'" },
     { name = "agentenv-framework-protocol", editable = "packages/agentenv-protocol" },
     { name = "anyio", marker = "extra == 'vercel'", specifier = ">=4,<5" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
@@ -141,7 +135,6 @@ requires-dist = [
     { name = "click", specifier = ">=8.0.0" },
     { name = "cryptography", specifier = ">=42" },
     { name = "e2b", specifier = "~=2.46.4" },
-    { name = "fastapi", marker = "extra == 'explorer'", specifier = ">=0.110" },
     { name = "fastmcp", marker = "extra == 'dev'", specifier = ">=3.4,<4" },
     { name = "google-api-core", marker = "extra == 'gcp'", specifier = ">=2.24" },
     { name = "google-auth", marker = "extra == 'gcp'", specifier = ">=2.40" },
@@ -175,10 +168,9 @@ requires-dist = [
     { name = "tenki", extras = ["async"], marker = "extra == 'tenki'", specifier = "~=1.4.1" },
     { name = "tensorlake", marker = "extra == 'tensorlake'", specifier = "~=0.5.140" },
     { name = "uvicorn", specifier = ">=0.47" },
-    { name = "uvicorn", marker = "extra == 'explorer'", specifier = ">=0.29" },
     { name = "vercel-sandbox", marker = "extra == 'vercel'", specifier = ">=0.7.0,<0.8" },
 ]
-provides-extras = ["aws", "explorer", "gcp", "sail", "vercel", "tensorlake", "tenki", "dev", "smol"]
+provides-extras = ["aws", "gcp", "sail", "vercel", "tensorlake", "tenki", "dev", "smol"]
 
 [[package]]
 name = "agentenv-framework-protocol"
