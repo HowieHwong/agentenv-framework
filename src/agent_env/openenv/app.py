@@ -44,8 +44,7 @@ def build_app(
     when ``reward`` can't score every task."""
     with namespace_routing():
         prepared = {split: _prepared(source, sandbox) for split, source in _sources(bundle).items()}
-        served = Served(splits=_served(_splits(bundle, prepared), reward),
-                        reward=reward if callable(reward) else None, sandbox=sandbox)
+        served = Served(splits=_served(_splits(bundle, prepared), reward), sandbox=sandbox)
     app = create_app(functools.partial(AgentEnvEnvironment, served), CallToolAction, CallToolObservation,
                      env_name=_env_name(prepared), max_concurrent_envs=max_concurrent_envs,
                      reset_observation_cls=Observation)
@@ -111,10 +110,11 @@ def _served(splits: dict[str, list[tuple[str, Task]]],
             except EpisodeError as e:
                 refused[task.id] = str(e)
                 continue
-            scored_by, problem = _scored_by(task, reward)
+            reward_of, problem = _reward_of(task, reward)
             if problem:
                 unscorable[task.id] = problem
-            kept.append(ServedTask(task, name, spec, scored_by))
+                continue
+            kept.append(ServedTask(task, name, spec, reward_of))
         served[split] = tuple(kept)
     for why in refused.values():
         logger.warning("left out: %s", why)
@@ -126,16 +126,30 @@ def _served(splits: dict[str, list[tuple[str, Task]]],
     return served
 
 
-def _scored_by(task: Task, reward: str | Callable[[dict[str, float]], float] | None) -> tuple[str | None, str | None]:
-    """The step whose score is ``task``'s reward, or why ``reward`` can't choose one; a function chooses none."""
+def _reward_of(task: Task, reward: str | Callable[[dict[str, float]], float] | None
+               ) -> tuple[Callable[[dict[str, float]], float | None] | None, str | None]:
+    """``task``'s reward as a function of its scores, or why ``reward`` can't make one."""
     if callable(reward):
-        return None, None
+        return reward, None
     scoring = [step.id for step in task.steps if getattr(step, "verifier_id", None)]
     if reward is None:
         if len(scoring) > 1:
             return None, (f"task {task.id!r} records a score at each of {', '.join(scoring)}; name the one that is "
                           "its reward with reward=<step id>")
-        return (scoring[0] if scoring else None), None
+        return (_score_at(scoring[0]) if scoring else _unscored), None
     if reward not in scoring:
         return None, f"task {task.id!r} records no score at step {reward!r}; it records them at {scoring}"
-    return reward, None
+    return _score_at(reward), None
+
+
+def _score_at(step: str) -> Callable[[dict[str, float]], float]:
+    def score(scores: dict[str, float]) -> float:
+        if step not in scores:
+            raise LookupError(f"the run recorded no score at step {step!r}")
+        return scores[step]
+
+    return score
+
+
+def _unscored(scores: dict[str, float]) -> None:
+    return None

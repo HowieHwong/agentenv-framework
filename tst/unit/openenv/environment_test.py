@@ -10,6 +10,7 @@ from agentenv_protocol import EnvironmentTool, ToolResult, ToolSessionError
 from openenv.core.env_server.mcp_types import CallToolAction, ListToolsAction, ToolErrorType
 
 import agent_env.task.episode.run as episode_run
+from agent_env.openenv.app import _score_at
 from agent_env.openenv.environment import ENDED, AgentEnvEnvironment, Served, ServedTask
 from agent_env.task import EpisodeSpec, Task
 from tst.unit.task.episode.run_test import ALICE, ITEMS, REPLIES, TURN, _gate
@@ -64,10 +65,10 @@ def _task(*steps, id="dock"):
     return Task.from_dict({"id": id, "version": 1, "steps": [dict(step) for step in steps]})
 
 
-def _env(*steps, reward=None, scored_by="replies", splits=None):
+def _env(*steps, reward=_score_at("replies"), splits=None):
     task = _task(*steps)
-    served = (ServedTask(task, "dock", EpisodeSpec.from_task(task), scored_by),)
-    return AgentEnvEnvironment(Served(splits=splits or {"all": served}, reward=reward, sandbox=None))
+    served = (ServedTask(task, "dock", EpisodeSpec.from_task(task), reward),)
+    return AgentEnvEnvironment(Served(splits=splits or {"all": served}, sandbox=None))
 
 
 async def _call(env, tool, **arguments):
@@ -77,8 +78,9 @@ async def _call(env, tool, **arguments):
 @pytest.mark.asyncio
 async def test_the_task_api_lists_each_split_with_each_tasks_prompt_and_agent(teardowns, tools):
     tasks = [_task(ITEMS, ALICE, {**TURN, "prompt": f"Add crate {n}."}, REPLIES, id=f"dock-{n}") for n in range(3)]
-    served = tuple(ServedTask(task, f"dock-{n}", EpisodeSpec.from_task(task), "replies") for n, task in enumerate(tasks))
-    env = AgentEnvEnvironment(Served(splits={"smoke": served[:1], "all": served}, reward=None, sandbox=None))
+    served = tuple(ServedTask(task, f"dock-{n}", EpisodeSpec.from_task(task), _score_at("replies"))
+                   for n, task in enumerate(tasks))
+    env = AgentEnvEnvironment(Served(splits={"smoke": served[:1], "all": served}, sandbox=None))
 
     assert env.list_splits() == ["smoke", "all"]
     assert (env.num_tasks("smoke"), env.num_tasks("all")) == (1, 3)
@@ -339,10 +341,11 @@ async def test_a_reward_names_its_score_and_a_missing_or_raising_one_leaves_the_
         await env.reset_async()
         return await _call(env, "end_turn", response="Added.")
 
-    assert (await ended(scored_by=None, reward=lambda scores: scores["replies"] * 2)).reward == 2.0
-    missing = await ended(scored_by="other")
-    assert (missing.reward, missing.metadata["error"]) == (None, "the run recorded no score at step 'other'")
-    raising = await ended(scored_by=None, reward=lambda scores: scores["other"])
-    assert (raising.reward, raising.metadata["error"]) == (None, "reward= raised KeyError: 'other'")
-    assert (await ended(scored_by=None)).metadata == {"scores": {"replies": 1.0}, "task": {
+    assert (await ended(reward=lambda scores: scores["replies"] * 2)).reward == 2.0
+    missing = await ended(reward=_score_at("other"))
+    assert (missing.reward, missing.metadata["error"]) == (
+        None, "no reward: LookupError: the run recorded no score at step 'other'")
+    raising = await ended(reward=lambda scores: scores["other"])
+    assert (raising.reward, raising.metadata["error"]) == (None, "no reward: KeyError: 'other'")
+    assert (await ended(reward=lambda scores: None)).metadata == {"scores": {"replies": 1.0}, "task": {
         "id": "dock", "name": "dock", "split": "all", "index": 0}}

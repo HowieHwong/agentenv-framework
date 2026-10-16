@@ -39,27 +39,26 @@ ENDED = "the episode has ended; call reset"
 
 @dataclass(frozen=True)
 class ServedTask:
-    """A task served as an episode, and the step whose score is its reward unless the reward is a function."""
+    """A task served as an episode, and its reward as a function of the scores it records, by step id."""
 
     task: Task
     name: str
     spec: EpisodeSpec
-    scored_by: str | None
+    reward: Callable[[dict[str, float]], float | None]
 
 
 @dataclass
 class Served:
-    """What one server serves, shared by every session: each split's tasks, the reward rule, where envs deploy, and
-    the sessions holding an episode, which the server's shutdown tears down."""
+    """What one server serves, shared by every session: each split's tasks, where envs deploy, and the sessions
+    holding an episode, which the server's shutdown tears down."""
 
     splits: dict[str, tuple[ServedTask, ...]]
-    reward: Callable[[dict[str, float]], float] | None
     sandbox: str | None
     live: set[AgentEnvEnvironment] = field(default_factory=set)
     ending: set[asyncio.Task] = field(default_factory=set)
 
     async def close(self, reason: str) -> None:
-        await asyncio.gather(*(env._close(reason) for env in list(self.live)), *self.ending)
+        await asyncio.gather(*(env._abandon_when_free(reason) for env in list(self.live)), *self.ending)
 
     def end_later(self, ending: Coroutine[Any, Any, None]) -> asyncio.Task:
         task = asyncio.ensure_future(ending)
@@ -84,8 +83,7 @@ class AgentEnvEnvironment(Environment):
         self._turn: Turn | None = None
         self._tools: TurnTools | None = None
         self._stack: AsyncExitStack | None = None
-        self._done = False
-        self._state = State(episode_id=None, step_count=0)
+        self._state = State(episode_id=None, step_count=0, done=False)
 
     # The Task API
 
@@ -114,17 +112,17 @@ class AgentEnvEnvironment(Environment):
             return await self._reset(split, index)
 
     async def _reset(self, split: str | None, index: int | None) -> Observation:
-        await self._end("reset")
+        await self._abandon("reset")
         self._loop = asyncio.get_running_loop()
-        self._done, self._served_task, self._state = False, None, State(episode_id=None, step_count=0)
+        self._served_task, self._state = None, State(episode_id=None, step_count=0, done=False)
         if (split is None) != (index is None):
-            return self._ended("split and index go together: give both, or neither for the first task served")
+            return self._error_observation("split and index go together: give both, or neither for the first task served")
         if split is None:
             split, index = next(name for name, tasks in self._served.splits.items() if tasks), 0
         try:
             self._served_task = self._task_at(split, index)
         except IndexError as e:
-            return self._ended(str(e))
+            return self._error_observation(str(e))
         self._state = State(episode_id=None, step_count=0, task_id=self._served_task.task.id,
                             task_name=self._served_task.name, split=split, index=index, turn=None, done=False)
         self._served.live.add(self)
@@ -136,7 +134,7 @@ class AgentEnvEnvironment(Environment):
                 raise EpisodeError("the run ended before the agent's first turn")
             await self._open(turn)
         except Exception as e:
-            return await self._fail(e)
+            return await self._end_with_error(e)
         return Observation(done=False, reward=None, metadata={
             "prompt": turn.prompt, "system_prompt": turn.system_prompt, "task": self._task_metadata()})
 
@@ -149,13 +147,13 @@ class AgentEnvEnvironment(Environment):
 
     async def _step(self, action: Any, timeout_s: float | None) -> Observation:
         if isinstance(action, ListToolsAction):
-            if (ended := await self._ended_episode()) is not None:
-                return ListToolsObservation(tools=[], done=True, reward=None, metadata=ended)
+            if (stopped := await self._why_stopped()) is not None:
+                return ListToolsObservation(tools=[], done=True, reward=None, metadata=stopped)
             return ListToolsObservation(tools=[*map(_tool, self._tools.list()), END_TURN])
         if not isinstance(action, CallToolAction):
             raise TypeError(f"unsupported action {type(action).__name__}; use ListToolsAction or CallToolAction")
-        if (ended := await self._ended_episode()) is not None:
-            return CallToolObservation(tool_name=action.tool_name, done=True, reward=None, metadata=ended)
+        if (stopped := await self._why_stopped()) is not None:
+            return CallToolObservation(tool_name=action.tool_name, done=True, reward=None, metadata=stopped)
         self._state.step_count += 1
         if action.tool_name == END_TURN.name:
             return await self._end_turn(action.tool_name, action.arguments.get("response") or "")
@@ -181,9 +179,9 @@ class AgentEnvEnvironment(Environment):
         except RuntimeError:
             running = None
         if running is self._loop:
-            self._served.end_later(self._close("the session closed"))
+            self._served.end_later(self._abandon_when_free("the session closed"))
         else:
-            asyncio.run_coroutine_threadsafe(self._close("the session closed"), self._loop).result()
+            asyncio.run_coroutine_threadsafe(self._abandon_when_free("the session closed"), self._loop).result()
 
     async def _call(self, action: CallToolAction, timeout_s: float | None) -> CallToolObservation:
         name = action.tool_name
@@ -213,23 +211,18 @@ class AgentEnvEnvironment(Environment):
                     "prompt": turn.prompt, "system_prompt": turn.system_prompt})
             scores = await self._episode.result()
         except Exception as e:
-            observation = await self._fail(e)
+            observation = await self._end_with_error(e)
             return CallToolObservation(tool_name=name, done=True, reward=None, metadata=observation.metadata)
-        await self._end("the episode ended")
+        await self._abandon("the episode ended")
         return CallToolObservation(tool_name=name, done=True, **self._scored(scores))
 
     def _scored(self, scores: dict[str, float]) -> dict[str, Any]:
-        """The final observation's reward and metadata, as ``reward=`` makes a reward of the scores."""
-        self._finish()
+        self._state.done = True
         metadata: dict[str, Any] = {"scores": scores, "task": self._task_metadata()}
-        step = self._served_task.scored_by
         try:
-            reward = self._served.reward(scores) if self._served.reward else scores.get(step) if step else None
+            reward = self._served_task.reward(scores)
         except Exception as e:
-            reward, metadata["status"], metadata["error"] = None, "error", f"reward= raised {_described(e)}"
-        else:
-            if step and step not in scores:
-                metadata["status"], metadata["error"] = "error", f"the run recorded no score at step {step!r}"
+            reward, metadata["status"], metadata["error"] = None, "error", f"no reward: {_described(e)}"
         return {"reward": reward, "metadata": metadata}
 
     async def _open(self, turn: Turn) -> None:
@@ -239,13 +232,13 @@ class AgentEnvEnvironment(Environment):
         if clash := sorted({tool.name for tool in self._tools.list()} & {*RESERVED_TOOL_NAMES, END_TURN.name}):
             raise EpisodeError(f"the env offers tools OpenEnv reserves: {', '.join(clash)}")
 
-    async def _ended_episode(self) -> dict[str, Any] | None:
+    async def _why_stopped(self) -> dict[str, Any] | None:
         """The error metadata a step answers with once the episode can't go on: it has ended, its run has, or the call
         opening its turn was cancelled."""
-        if self._done or self._episode is None:
+        if self._episode is None:
             return {"status": "error", "error": ENDED, "task": self._task_metadata()}
         if self._tools is None:
-            return (await self._fail("the call opening the episode's turn was cancelled")).metadata
+            return (await self._end_with_error("the call opening the episode's turn was cancelled")).metadata
         if not self._episode.finished:
             return None
         try:
@@ -253,26 +246,23 @@ class AgentEnvEnvironment(Environment):
             error = "the run ended while the agent's turn was open"
         except Exception as e:
             error = _described(e)
-        return (await self._fail(error)).metadata
+        return (await self._end_with_error(error)).metadata
 
-    async def _fail(self, error: Exception | str) -> Observation:
-        await self._end(error if isinstance(error, str) else _described(error))
-        return self._ended(error if isinstance(error, str) else _described(error))
+    async def _end_with_error(self, error: Exception | str) -> Observation:
+        message = error if isinstance(error, str) else _described(error)
+        await self._abandon(message)
+        return self._error_observation(message)
 
-    def _ended(self, error: str) -> Observation:
-        self._finish()
+    def _error_observation(self, error: str) -> Observation:
+        self._state.done = True
         return Observation(done=True, reward=None, metadata={
             "status": "error", "error": error, "task": self._task_metadata()})
 
-    def _finish(self) -> None:
-        self._done = True
-        self._state.done = True
-
-    async def _close(self, reason: str) -> None:
+    async def _abandon_when_free(self, reason: str) -> None:
         async with self._lock:
-            await self._end(reason)
+            await self._abandon(reason)
 
-    async def _end(self, reason: str) -> None:
+    async def _abandon(self, reason: str) -> None:
         """Abandon the episode and close the turn's tools, waiting for the teardown; the caller holds the lock. The
         abandon is tracked before anything is awaited, so a server shutting down meanwhile waits for it too."""
         episode, self._episode = self._episode, None
