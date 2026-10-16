@@ -122,6 +122,19 @@ async def test_an_episode_resets_to_its_turn_steps_through_the_envs_tools_and_is
 
 
 @pytest.mark.asyncio
+async def test_a_step_from_a_worker_thread_runs_on_the_episodes_loop_as_openenvs_playground_steps(teardowns, tools):
+    env = _env(ITEMS, ALICE, TURN, REPLIES)
+    assert (await asyncio.to_thread(env.step, ListToolsAction())).metadata["error"] == ENDED
+    await env.reset_async()
+
+    listed = await asyncio.to_thread(env.step, ListToolsAction())
+    ended = await asyncio.to_thread(env.step, CallToolAction(tool_name="end_turn", arguments={"response": "Added."}))
+
+    assert [tool.name for tool in listed.tools] == ["add_item", "end_turn"]
+    assert (ended.done, ended.reward) == (True, 1.0)
+
+
+@pytest.mark.asyncio
 async def test_a_task_with_two_turns_hands_over_the_next_prompt_then_the_reward(teardowns, tools):
     env = _env(ITEMS, ALICE, TURN, AGAIN, REPLIES)
     await env.reset_async()

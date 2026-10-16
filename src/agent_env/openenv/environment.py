@@ -144,7 +144,10 @@ class AgentEnvEnvironment(Environment):
         return await self._call(action, timeout_s)
 
     def step(self, action: Any, timeout_s: float | None = None, **kwargs: Any) -> Observation:
-        raise NotImplementedError("an AgentEnv episode runs on the server's event loop: step_async")
+        """OpenEnv's web playground steps from a worker thread; the episode lives on the loop its reset ran on."""
+        if self._loop is None:
+            return asyncio.run(self.step_async(action, timeout_s))
+        return asyncio.run_coroutine_threadsafe(self.step_async(action, timeout_s), self._loop).result()
 
     @property
     def state(self) -> State:
