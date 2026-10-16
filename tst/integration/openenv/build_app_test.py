@@ -137,7 +137,8 @@ async def test_a_bundle_task_played_by_openenvs_clients_scores_as_agent_env_run_
         async with MCPToolClient(base_url=url, message_timeout_s=300) as mcp:
             await mcp.reset(split="all", index=0)
             assert "items_add_item" in {tool.name for tool in await mcp.list_tools()}
-            assert json.loads(await mcp.call_tool("items_whoami"))["role"] == "alice@example.com"
+            whoami = await mcp.call_tool("items_whoami")  # /mcp answers a plain Environment's call with its observation
+            assert json.loads(whoami["result"]["data"])["role"] == "alice@example.com"
     assert _left(items.sandboxes) == []
 
     echo = items.bundle("dock-echo", {"crate": items(agent=put_test_agent(f"echo-{uuid.uuid4().hex[:8]}").id)})
