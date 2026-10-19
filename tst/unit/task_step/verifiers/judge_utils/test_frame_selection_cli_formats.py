@@ -39,9 +39,9 @@ def _stream_run() -> str:
 def test_stream_json_pairs_each_call_with_its_result_by_id_in_run_order():
     t = FS.transcript_from_raw(_stream_run())
     assert [(a.index, a.tool, a.args) for a in t.actions] == [
-        (1, "linear_get_issue", {"id": "ENG-1"}),
-        (2, "linear_update_issue", {"id": "ENG-1", "state": "Done"}),
-        (3, "gmail_send", {"to": "a@b.c"})]
+        (1, "gw_linear_get_issue", {"id": "ENG-1"}),
+        (2, "gw_linear_update_issue", {"id": "ENG-1", "state": "Done"}),
+        (3, "gw_gmail_send", {"to": "a@b.c"})]
     assert t.actions[0].result == '{"state": "Todo"}\n<image>'
     assert t.actions[1].result == {"error": "permission denied"}
     assert t.actions[2].result is None and all(a.screenshot is None for a in t.actions)
@@ -52,10 +52,10 @@ def test_stream_json_action_log_shows_calls_results_and_the_agent_text():
     t = FS.transcript_from_raw(_stream_run())
     lines = FS.action_log(t.actions, messages=t.messages).splitlines()
     assert lines[0] == 'agent said: "Looking up the issue first."'
-    assert lines[1].startswith('1. linear_get_issue {"id": "ENG-1"} -> ')
-    assert lines[2] == ('2. linear_update_issue {"id": "ENG-1", "state": "Done"}'
+    assert lines[1].startswith('1. gw_linear_get_issue {"id": "ENG-1"} -> ')
+    assert lines[2] == ('2. gw_linear_update_issue {"id": "ENG-1", "state": "Done"}'
                         ' -> {"error": "permission denied"}')
-    assert lines[3] == '3. gmail_send {"to": "a@b.c"}' and "Updated ENG-1" not in "\n".join(lines)
+    assert lines[3] == '3. gw_gmail_send {"to": "a@b.c"}' and "Updated ENG-1" not in "\n".join(lines)
 
 
 def _part(pid: str, tool: str, state: dict) -> dict:
@@ -91,10 +91,15 @@ def test_an_empty_stream_json_result_is_kept_apart_from_no_result():
     assert "search" in FS.action_log([first]) and "-> []" in FS.action_log([first])
 
 
-def test_claude_mcp_tool_names_drop_the_server_alias_and_builtin_tools_keep_theirs():
-    raw = json.dumps([_assistant(_use("t1", "mcp__env7948__slack_post", {}), _use("t2", "mcp__hg__slack_post", {}),
-                                 _use("t3", "Bash", {"command": "ls"}), _use("t4", "mcp__odd__", {}))])
-    assert [a.tool for a in FS.transcript_from_raw(raw).actions] == ["slack_post", "slack_post", "Bash", "mcp__odd__"]
+def test_tool_names_are_spelled_one_way_across_clis_and_deploys():
+    claude = json.dumps([_assistant(_use("t1", "mcp__env7948__slack_post", {}), _use("t2", "mcp__hg__slack_post", {}),
+                                    _use("t3", "Bash", {"command": "ls"}), _use("t4", "mcp__odd__", {}),
+                                    _use("t5", "mcp__env__slack_post", {}))])
+    assert [a.tool for a in FS.transcript_from_raw(claude).actions] == [
+        "slack_post", "hg_slack_post", "Bash", "mcp__odd__", "env_slack_post"]
+    opencode = json.dumps([_part(f"p{i}", tool, {"status": "completed", "input": {}, "output": "ok"})
+                           for i, tool in enumerate(["env0123_slack_post", "hg_slack_post", "mcp_3fa9c0_slack_post", "bash"])])
+    assert [a.tool for a in FS.transcript_from_raw(opencode).actions] == ["slack_post", "hg_slack_post", "slack_post", "bash"]
 
 
 def test_other_cli_stream_formats_are_not_read_as_an_empty_claude_run():

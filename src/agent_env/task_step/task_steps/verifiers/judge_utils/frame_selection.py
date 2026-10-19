@@ -30,11 +30,11 @@ from agent_env.task_step.task_steps.verifiers.judge_utils.trajectory_filter impo
 MAX_ARGS_CHARS = DEFAULT_ACTION_LOG_MAX_ARGS_CHARS
 MAX_RESULT_CHARS = DEFAULT_ACTION_LOG_MAX_RESULT_CHARS
 MAX_AGENT_MESSAGE_CHARS = 200
-# The per-server prefix some CLIs put on MCP tool names: random hex that carries no meaning.
-_HEX_TOOL_PREFIX = re.compile(r"^mcp_[0-9a-f]+_")
-# Claude Code's MCP tool names, ``mcp__<server>__<tool>``: the server is an alias, often random per deploy
-# (``env7948``), so the same tool would be named differently in every run.
-_CLAUDE_MCP_PREFIX = re.compile(r"^mcp__.+?__(?=.)")
+# Claude Code names an MCP tool ``mcp__<server>__<tool>``; OpenCode names it ``<server>_<tool>``.
+_CLAUDE_MCP_NAME = re.compile(r"^mcp__(.+?)__(.+)$")
+# A server alias drawn at random per deploy (``random_mcp_server_name``: ``env`` + 4 digits) or the older
+# random hex one: meaningless, and different in every run. A declared server name (``hg``) is kept.
+_RANDOM_SERVER_PREFIX = re.compile(r"^(?:env\d{4}|mcp_[0-9a-f]+)_(?=.)")
 # Replaces a base64 image payload in rendered text before any cut, so the cut lands on text.
 _IMAGE_PLACEHOLDER = "<image>"
 # A second candidate scoring at least this fraction of a criterion's best match is kept as a near-tie.
@@ -134,6 +134,16 @@ def transcript_from_raw(raw_text: str) -> Transcript:
     return Transcript([], [])
 
 
+def _tool_name(name: str) -> str:
+    """One spelling of an MCP tool name across CLIs and deploys: ``<server>_<tool>``, without a random
+    server alias. ``mcp__hg__slack_post`` and OpenCode's ``hg_slack_post`` both give ``hg_slack_post``;
+    ``mcp__env7948__slack_post`` and ``env0123_slack_post`` both give ``slack_post``."""
+    m = _CLAUDE_MCP_NAME.match(name)
+    if m:
+        name = f"{m.group(1)}_{m.group(2)}"
+    return _RANDOM_SERVER_PREFIX.sub("", name)
+
+
 def _is_claude_stream_row(row: dict) -> bool:
     """A row only Claude Code's stream-json writes: a ``system`` row, or an assistant / user turn whose
     ``message`` is an object. Other CLIs share some row types (Gemini also closes on ``{"type": "result"}``)
@@ -198,7 +208,7 @@ def _transcript_from_stream_json(rows: list[dict]) -> Transcript:
             elif row.get("type") == "assistant" and kind == "tool_use":
                 args = block.get("input") if isinstance(block.get("input"), dict) else {}
                 position[str(block.get("id"))] = len(actions)
-                actions.append(TrajectoryAction(index=len(actions) + 1, tool=_CLAUDE_MCP_PREFIX.sub("", str(block.get("name") or "")),
+                actions.append(TrajectoryAction(index=len(actions) + 1, tool=_tool_name(str(block.get("name") or "")),
                                                 args=args, screenshot=None))
             elif row.get("type") == "user" and kind == "tool_result" and str(block.get("tool_use_id")) in position:
                 i = position[str(block["tool_use_id"])]
@@ -230,7 +240,7 @@ def _transcript_from_opencode(events: list[dict]) -> Transcript:
                 result = {"error": _decoded(reason)}
             else:
                 result = _decoded(state.get("output")) if state.get("output") not in ("", None) else None
-            tool = _HEX_TOOL_PREFIX.sub("", str(part.get("tool") or ""))
+            tool = _tool_name(str(part.get("tool") or ""))
             key = str(part.get("id") or len(actions))
             if key in position:
                 i = position[key]
