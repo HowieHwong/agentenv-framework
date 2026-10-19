@@ -78,19 +78,26 @@ class Turn:
 
     async def end(self, response: str | None = None) -> None:
         """Hand the turn back, and the run carries on. No reply records an empty one, as an agent that answers with
-        nothing leaves. Once the turn is over, ended or not, this does nothing."""
+        nothing leaves. Once the turn is over, ended or not, this does nothing; a stand-in that can't be reached
+        fails the run, which ``next_turn()`` and ``result()`` report."""
         if not self._open:
             return
         self._open = False
         reply = response or ""
         spans = [*self._spans, _span("turn", "chain", self._started, completion={"content": [
             {"type": "text", "text": reply}]})]
-        await self._stand_in.reply(self._task_id, text=reply, trajectory=spans, tool_call_count=len(self._spans))
+        await self._reply(text=reply, trajectory=spans, tool_call_count=len(self._spans))
 
     async def _fail(self, error: Exception) -> None:
         if self._open:
             self._open = False
-            await self._stand_in.reply(self._task_id, error=str(error))
+            await self._reply(error=str(error))
+
+    async def _reply(self, **reply: Any) -> None:
+        try:
+            await self._stand_in.reply(self._task_id, **reply)
+        except httpx.HTTPError as e:
+            logger.warning("turn %r of agent %r: its reply didn't reach the stand-in: %s", self.step_id, self.agent, e)
 
 
 class TurnTools:

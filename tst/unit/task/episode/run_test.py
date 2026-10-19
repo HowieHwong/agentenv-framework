@@ -3,6 +3,7 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 import pytest_asyncio
 from agentenv_protocol import EnvironmentTool, ToolResult
@@ -681,3 +682,16 @@ async def test_a_prompts_own_system_prompt_wins_over_the_agents(teardowns):
     episode = await _spec(ITEMS, ALICE, {**TURN, "system_prompt": "Count first."}, REPLIES).start()
 
     assert (await episode.next_turn()).system_prompt == "Count first."
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_cant_reach_the_stand_in_leaves_the_runs_own_failure_to_report(caplog):
+    class _Unreachable(_SandboxedStandIn):
+        async def reply(self, task_id, **reply):
+            raise httpx.ConnectError("the sandbox is gone")
+
+    turn = _sandboxed_turn(_Unreachable())
+
+    await turn.end("done")
+
+    assert "its reply didn't reach the stand-in: the sandbox is gone" in caplog.text
