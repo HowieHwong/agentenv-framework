@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import os
 import shutil
 import unicodedata
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version as package_version
 from pathlib import Path
 
+from agent_env.artifact.registry import ARTIFACT_REGISTRY, canonical_type, get_artifact_registry
 from agent_env.bundle import _toml
 from agent_env.bundle._fs import fold, os_reason, show
 from agent_env.bundle._secrets import scrub
@@ -20,14 +23,20 @@ from agent_env.bundle.parse import BundleError, parse_bundle, root_problems, seg
 from agent_env.bundle.plan import STORE_GETTERS, check_bundle
 from agent_env.bundle.resolve import resolve_bundle
 from agent_env.config import get_config
-from agent_env.entity_refs import EntityKind, RefRole, RefSite, ref_sites
+from agent_env.entity.refs import EntityKind, RefRole, RefSite, ref_sites
+from agent_env.env import registry as env_registry
+from agent_env.env.registry import get_env_registry
 from agent_env.eval import Eval
+from agent_env.entity.scopes import FieldScope, prune
+from agent_env.plugins import ARTIFACTS, ENVS, TASK_STEPS, inventory, load_failures
 from agent_env.store.base import NotFoundError
 from agent_env.store.ids import LOCAL_PREFIX
 from agent_env.task import Task
+from agent_env.task_step import registry as task_step_registry
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
+from agent_env.task_step.task_steps.install_agent import InstallAgentTaskStep
 from agent_env.task_step.task_steps.verifiers.rubrics_verifier import RubricsVerifierTaskStep
 
 # How long a name taken from an id may be, in bytes; ids are capped far above it, and a longer name helps nobody.
@@ -64,6 +73,16 @@ class Dropped:
 
 
 @dataclass(frozen=True)
+class Need:
+    """Something a task uses that core doesn't ship, and what registers it here."""
+
+    where: str
+    what: str  # step type, env type or artifact type
+    name: str
+    by: str  # the installed distribution that registers it, or "configuration" for a config file's impls
+
+
+@dataclass(frozen=True)
 class ImportedTask:
     path: str  # in the bundle: tasks/<name>.json
     id: str
@@ -89,12 +108,19 @@ class BundleImport:
     pinned: tuple[Pinned, ...]
     floating: tuple[Floating, ...]
     dropped: tuple[Dropped, ...]
+    needs: tuple[Need, ...]
     undeclared: tuple[str, ...]  # the steps whose type declares no references, so any they make float
     duplicates: tuple[str, ...]  # the eval's entries that named a task it already named
 
     def report(self) -> list[tuple[str, list[str]]]:
-        """How each reference and secret was written, as titled lists of lines; an empty section is left out."""
+        """What the task needs beyond core, and how each reference, secret and scoped field was written, as titled
+        lists of lines; an empty section is left out."""
+        needed: dict[tuple[str, str, str], list[str]] = {}
+        for need in self.needs:
+            needed.setdefault((need.by, need.name, need.what), []).append(need.where)
         return _sections([
+            ("Needs beyond core", [f"{by}: {name} ({what}), at {'; '.join(wheres)}"
+                                   for (by, name, what), wheres in sorted(needed.items())]),
             ("Pinned", [f"{pin.kind.value} {pin.id} v{pin.version}{' (as stored)' if pin.stored else ''}: "
                         f"{pin.where}" for pin in self.pinned]),
             ("Floating", [f"{ref.kind.value} {ref.id}: {ref.where}: {ref.why}" for ref in self.floating]
@@ -104,17 +130,21 @@ class BundleImport:
         ])
 
 
-def import_task(task_id: str, dest: Path | str, *, version: int | None = None) -> BundleImport:
-    """Write the stored task ``task_id``, at ``version`` or its latest, as a bundle at ``dest``."""
-    importer = _Importer(Path(dest))
+def import_task(task_id: str, dest: Path | str, *, version: int | None = None,
+                include_scopes: Collection[FieldScope] = ()) -> BundleImport:
+    """Write the stored task ``task_id``, at ``version`` or its latest, as a bundle at ``dest``. Its steps' scoped
+    fields are left out unless ``include_scopes`` names their scope."""
+    importer = _Importer(Path(dest), include_scopes)
     task = Task.get(task_id, version)
     importer.add_task(task)
     return importer.write(f"Imported from the store's task {task.id} v{task.version}.")
 
 
-def import_eval(eval_id: str, dest: Path | str, *, version: int | None = None) -> BundleImport:
-    """Write the stored eval ``eval_id``, at ``version`` or its latest, and the tasks it names as a bundle."""
-    importer = _Importer(Path(dest))
+def import_eval(eval_id: str, dest: Path | str, *, version: int | None = None,
+                include_scopes: Collection[FieldScope] = ()) -> BundleImport:
+    """Write the stored eval ``eval_id``, at ``version`` or its latest, and the tasks it names as a bundle, leaving out
+    their steps' scoped fields as ``import_task`` does."""
+    importer = _Importer(Path(dest), include_scopes)
     stored = Eval.get(eval_id, version)
     names, seen = [], set()
     for entry in stored.tasks:
@@ -136,8 +166,9 @@ def import_eval(eval_id: str, dest: Path | str, *, version: int | None = None) -
 
 
 class _Importer:
-    def __init__(self, dest: Path):
+    def __init__(self, dest: Path, include_scopes: Collection[FieldScope] = ()):
         self.dest = Path(os.path.abspath(dest.expanduser()))  # so ``.`` has a name, and a sibling to stage in
+        self.include_scopes = frozenset({FieldScope.TASK, *include_scopes})
         self.files: dict[str, str] = {}
         self.taken: dict[str, set[str]] = {"tasks": set(), "evals": set()}  # folded names, per folder
         self.tasks: list[ImportedTask] = []
@@ -145,10 +176,13 @@ class _Importer:
         self.pinned: list[Pinned] = []
         self.floating: list[Floating] = []
         self.dropped: list[Dropped] = []
+        self.needs: list[Need] = []
         self.undeclared: list[str] = []
         self.duplicates: list[str] = []
         self.problems: list[str] = []
         self.read: dict[tuple[EntityKind, str, int | None], int | str] = {}
+        self.types: dict[tuple[EntityKind, str, int | None], str] = {}  # each entity read, by its read key
+        self.origins: dict[tuple[str, str], str] | None = None
         _check_destination(self.dest)
 
     def add_task(self, task: Task) -> str:
@@ -160,23 +194,26 @@ class _Importer:
         found = []
         for step in steps:
             cls = registry[step["type"]]
-            found.append((step, cls, [site for site in ref_sites(cls.entity_refs or (), step)
-                                      if isinstance(site.value, str) and site.value]))
-        sites = [site for _, _, step_sites in found for site in step_sites]
+            pruned = prune(step, cls.field_scopes, self.include_scopes)  # first, so no pruned field is pinned
+            found.append((step, cls, pruned, [site for site in ref_sites(cls.entity_refs or (), step)
+                                              if isinstance(site.value, str) and site.value]))
+        sites = [site for *_, step_sites in found for site in step_sites]
         outputs = _output_names(sites)
-        deployed = {_nfc(site.value) for _, cls, step_sites in found if issubclass(cls, DeployEnvTaskStep)
+        deployed = {_nfc(site.value) for _, cls, _, step_sites in found if issubclass(cls, DeployEnvTaskStep)
                     for site in step_sites if site.ref.kind is EntityKind.ENV}
         for site in sites:  # each output, and each step that reads it, takes the output's name
             if outputs.get(_key(site), site.value) != site.value:
                 site.rewrite(outputs[_key(site)])
-        for step, cls, step_sites in found:
+        for step, cls, pruned, step_sites in found:
             where = f"{path}: step {step.get('id')!r}"
-            self.dropped += [Dropped(f"{where}: {at}", why) for at, why in scrub(step)]
+            self.dropped += [Dropped(f"{where}: {at}", why) for at, why in pruned + scrub(step)]
+            self._need(where, "step type", TASK_STEPS, cls.type, cls)
             if cls.entity_refs is None:
                 self.undeclared.append(f"{where} ({cls.type})")
             for site in step_sites:
                 if _key(site) not in outputs:  # the run writes an output again, so it takes no pin
                     self._pin(site, f"{where}: {site.path}", deployed)
+                    self._need_type(site, f"{where}: {site.path}")
             self._default_agents(step, where)
         self.files[path] = json.dumps(steps, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         self.tasks.append(ImportedTask(path, task.id, task.version, len(steps)))
@@ -194,8 +231,8 @@ class _Importer:
         files = sorted([*self.files, "README.md"])
         imported = BundleImport(root=self.dest, files=tuple(files), tasks=tuple(self.tasks), eval=self.eval,
                                 pinned=tuple(self.pinned), floating=tuple(self.floating),
-                                dropped=tuple(self.dropped), undeclared=tuple(self.undeclared),
-                                duplicates=tuple(self.duplicates))
+                                dropped=tuple(self.dropped), needs=tuple(self.needs),
+                                undeclared=tuple(self.undeclared), duplicates=tuple(self.duplicates))
         self.files["README.md"] = _readme(description, imported)
         staging = self.dest.parent / f".{self.dest.name}.import-{uuid.uuid4().hex[:8]}"
         try:
@@ -249,7 +286,9 @@ class _Importer:
         """The version of ``entity_id`` the store holds, at ``version`` or its latest, or why it can't be read."""
         if (kind, entity_id, version) not in self.read:
             try:
-                self.read[kind, entity_id, version] = STORE_GETTERS[kind](entity_id, version).version
+                entity = STORE_GETTERS[kind](entity_id, version)
+                self.read[kind, entity_id, version] = entity.version
+                self.types[kind, entity_id, version] = entity.type
             except NotFoundError:
                 at = f" v{version}" if version is not None else ""
                 self.read[kind, entity_id, version] = f"there is no {kind.value} {entity_id!r}{at} in the store"
@@ -258,9 +297,37 @@ class _Importer:
                                                        f"({type(e).__name__}: {e})")
         return self.read[kind, entity_id, version]
 
+    def _need_type(self, site: RefSite, where: str) -> None:
+        """An env or artifact the task references whose type core doesn't ship is a need."""
+        if site.ref.kind not in (EntityKind.ENV, EntityKind.ARTIFACT):
+            return
+        self._read(site.ref.kind, site.value, site.version)
+        if (type_ := self.types.get((site.ref.kind, site.value, site.version))) is None:
+            return  # the store can't read it, which pinning reports, or a run reads it later
+        if site.ref.kind is EntityKind.ENV:
+            self._need(where, "env type", ENVS, type_, get_env_registry().get(type_))
+        else:
+            self._need(where, "artifact type", ARTIFACTS, (name := canonical_type(type_)),
+                       get_artifact_registry().get(name))
+
+    def _need(self, where: str, what: str, group: str, name: str, cls: type | None) -> None:
+        """``name``, of the plugin ``group``, is a need when core doesn't ship it, named with what registers ``cls``,
+        the class it resolves to here: the distribution whose entry point names that class, or configuration. A plugin
+        the registry build skipped registers nothing, so it isn't loaded again to compare."""
+        if name in _BUILTINS[group]():
+            return
+        if self.origins is None:
+            self.origins = {(contribution.group, contribution.name): (distribution.name, contribution.value)
+                            for distribution in inventory(load=False).distributions
+                            for contribution in distribution.contributions}
+        distribution, value = self.origins.get((group, name), (None, None))
+        registered = value is not None and cls is not None and name not in load_failures().get(group, {})
+        by = distribution if registered and _names(value, cls) else "configuration"
+        self.needs.append(Need(where, what, name, by))
+
     def _default_agents(self, step: dict, where: str) -> None:
         """A step that names no agent deploys the configured default, which no field pins."""
-        if step["type"] == DeployAgentTaskStep.type and step.get("a2a_agent_id") is None:
+        if step["type"] in (DeployAgentTaskStep.type, InstallAgentTaskStep.type) and step.get("a2a_agent_id") is None:
             field, what = "a2a_agent_id", "names no agent"
         elif (step["type"] == RubricsVerifierTaskStep.type and step.get("use_agent_judge")
               and step.get("agent_name") is None and step.get("judge_a2a_agent_id") is None):
@@ -279,6 +346,23 @@ class _Importer:
             name = f"{base}-{n}"
         self.taken[kind].add(fold(name))
         return name
+
+
+# What core ships, per plugin group: anything else a task uses is a need.
+_BUILTINS = {TASK_STEPS: task_step_registry._builtin_registry, ENVS: env_registry._builtin_registry,
+             ARTIFACTS: lambda: ARTIFACT_REGISTRY}
+
+
+def _names(value: str, cls: type) -> bool:
+    """Whether the entry point ``value``, ``module:attribute``, names ``cls``."""
+    module, _, attribute = value.partition(":")
+    try:
+        named = importlib.import_module(module)
+        for part in attribute.split("."):
+            named = getattr(named, part)
+    except (ImportError, AttributeError):
+        return False
+    return named is cls
 
 
 def _output_names(sites: list[RefSite]) -> dict[tuple[EntityKind, str], str]:

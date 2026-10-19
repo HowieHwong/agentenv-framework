@@ -27,7 +27,7 @@ from agent_env.a2a_agent import A2AAgent
 from agent_env.artifact import Artifact
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.artifact.registry import canonical_type, get_artifact_registry
-from agent_env.entity_refs import EntityRef, RefRole, ref_sites
+from agent_env.entity.refs import EntityRef, RefRole, ref_sites
 from agent_env.env.registry import get_env_registry
 from agent_env.eval import Eval, EvalTask
 from agent_env.store.base import NotFoundError
@@ -338,6 +338,7 @@ def _preflight(write: Write, task: Task, unwritten: set[tuple[str, str]]) -> tup
     outputs = {output.id for output in write.source.outputs}
     problems, unchecked = [], []
     for config, step in zip(write.source.config, task.steps):
+        problems.extend(step.config_problems())
         reads = _reads(config)
         if any(id in outputs for _, id in reads):
             continue
