@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import time
 import uuid
 from contextlib import nullcontext
@@ -115,6 +116,66 @@ _DEFAULT_USER_SIM_OUTPUT_FORMAT: dict[str, Any] = {
 }
 
 
+NEXT_ENV_EVENT = "next_env_event"
+DEFAULT_WAKE_MESSAGE = "[{virtual_time}] Time has passed. Check for anything new and handle it."
+_BETWEEN_TURNS_KEYS = ("mode", "wake", "wake_message", "end_time", "fire_timeout_seconds")
+_WAKES = ("message", "decide")
+_SETTLED_STATUSES = ("fired", "failed", "cancelled")
+_FIRE_POLL_SECONDS = 0.5
+
+
+def _utc(text: str) -> datetime:
+    """An RFC 3339 instant as an aware UTC datetime; ValueError without an offset."""
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{text!r} has no UTC offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _between_turns_spec(raw: Any) -> Optional[dict]:
+    """``between_turns`` with its defaults filled in, refusing a shape the turn loop can't follow; None when unset."""
+    if raw is None:
+        return None
+    spec = {"mode": raw} if isinstance(raw, str) else raw
+    if not isinstance(spec, dict):
+        raise ValueError(f"between_turns must be {NEXT_ENV_EVENT!r} or an object with a mode")
+    unknown = sorted(set(spec) - set(_BETWEEN_TURNS_KEYS))
+    if unknown:
+        raise ValueError(f"between_turns has unknown key(s) {unknown}; expected {list(_BETWEEN_TURNS_KEYS)}")
+    if spec.get("mode") != NEXT_ENV_EVENT:
+        raise ValueError(f"between_turns.mode must be {NEXT_ENV_EVENT!r}, got {spec.get('mode')!r}")
+    out = {"mode": NEXT_ENV_EVENT, "wake": spec.get("wake", "message"),
+           "wake_message": spec.get("wake_message", DEFAULT_WAKE_MESSAGE), "end_time": spec.get("end_time"),
+           "fire_timeout_seconds": spec.get("fire_timeout_seconds", 60)}
+    if out["wake"] not in _WAKES:
+        raise ValueError(f"between_turns.wake must be one of {list(_WAKES)}, got {out['wake']!r}")
+    if not isinstance(out["wake_message"], str) or not out["wake_message"].strip():
+        raise ValueError("between_turns.wake_message must be a non-empty string")
+    try:
+        out["wake_message"].format(virtual_time="", trigger_ids="")
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(f"between_turns.wake_message may use only {{virtual_time}} and {{trigger_ids}}: {e!r}") from e
+    if out["end_time"] is not None:
+        try:
+            _utc(out["end_time"])
+        except (TypeError, AttributeError, ValueError) as e:
+            raise ValueError(f"between_turns.end_time must be an RFC 3339 instant: {e}") from e
+    timeout = out["fire_timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"between_turns.fire_timeout_seconds must be a positive number, got {timeout!r}")
+    return out
+
+
+def _rearm_safe(when: dict) -> bool:
+    """Whether a time trigger keeps its mark across a clock re-arm: event-anchored, or one absolute `at`."""
+    at = when.get("at")
+    return "after" in when or ("every" not in when and isinstance(at, str) and not at.startswith("P"))
+
+
 class PromptAgentTaskStep(TaskStep):
     type: ClassVar[str] = "prompt_agent"
     entity_refs = (EntityRef.env("snapshot_config.env_id"),)
@@ -158,6 +219,8 @@ class PromptAgentTaskStep(TaskStep):
         *,
         snapshot_config: Optional[SnapshotConfig] = None,
         live_trajectory: bool = False,
+        between_turns: Optional[str | dict] = None,
+        record_env_clock: bool = False,
     ):
         # `prompt` is the legacy text-only field; `parts` is the multimodal
         # form that's the authoritative A2A wire shape. Exactly one must be set:
@@ -171,6 +234,9 @@ class PromptAgentTaskStep(TaskStep):
             self._validate_parts(parts)
         if max_conversation_turns < 1:
             raise ValueError("max_conversation_turns must be >= 1")
+        advance = _between_turns_spec(between_turns)
+        if advance is not None and max_conversation_turns < 2:
+            raise ValueError("between_turns needs max_conversation_turns >= 2: it acts between turns")
         if model_params:
             reserved = set(model_params) & MODEL_PARAMS_RESERVED
             if reserved:
@@ -201,6 +267,9 @@ class PromptAgentTaskStep(TaskStep):
         self.user_model = user_model
         self.snapshot_config = snapshot_config
         self.live_trajectory = live_trajectory
+        self.between_turns = between_turns
+        self.record_env_clock = record_env_clock
+        self._advance = advance
 
     @staticmethod
     def _validate_parts(parts: list[dict]) -> None:
@@ -276,6 +345,10 @@ class PromptAgentTaskStep(TaskStep):
             base["snapshot_config"] = self.snapshot_config.to_dict()
         if self.live_trajectory:
             base["live_trajectory"] = True
+        if self.between_turns is not None:
+            base["between_turns"] = self.between_turns
+        if self.record_env_clock:
+            base["record_env_clock"] = True
         return base
 
     @classmethod
@@ -312,6 +385,8 @@ class PromptAgentTaskStep(TaskStep):
                 else None
             ),
             live_trajectory=data.get("live_trajectory", False),
+            between_turns=data.get("between_turns"),
+            record_env_clock=data.get("record_env_clock", False),
         )
 
     def _trajectory_prefix(self) -> str:
@@ -418,7 +493,7 @@ class PromptAgentTaskStep(TaskStep):
         user_url = self.user_a2a_url or (
             (user_sim.a2a_url or user_sim.api_url) if user_sim else None
         )
-        if user_url is None and user_sim is None and self.max_conversation_turns > 1:
+        if user_url is None and user_sim is None and self.max_conversation_turns > 1 and self._advance is None:
             user_url = get_config().get_default_human_a2a_url()
 
         trajectory_output_prefix = self._trajectory_prefix()
@@ -481,6 +556,12 @@ class PromptAgentTaskStep(TaskStep):
                 logger.warning(
                     f"user agent '{self.user_agent_name}' advertises {A2AAgent.EXT_TRIGGERS} but "
                     f"max_conversation_turns={self.max_conversation_turns} (<2); the trigger engine is never invoked")
+        advance = self._advance
+        if advance is not None and advance["wake"] == "decide" and not (trig_ext and triggers_registered):
+            raise RuntimeError(f"{self.id}: between_turns wake 'decide' needs user agent '{self.user_agent_name}' to be a "
+                               f"user simulator with agent triggers registered")
+        clock_envs = ([d for d in context.deployed_envs if d.supports(EXT_CLOCK_URI, "state")]
+                      if advance is not None or self.record_env_clock else None)
 
         solver_context_id = a2a_context_id
         if self.context_id:
@@ -529,6 +610,7 @@ class PromptAgentTaskStep(TaskStep):
                 # agent and recorded on the conversation as `a2a_task_id`.
                 # This id is also used as part of the key name for the trajectory S3 object.
                 target_a2a_task_id = uuid.uuid4().hex
+                sent_clock = await self._env_clock_kwargs(clock_envs)
 
                 # The turn records the objects' own URLs, and only once the parts are ready to send, so an
                 # object the agent can't be sent leaves no turn waiting.
@@ -539,6 +621,7 @@ class PromptAgentTaskStep(TaskStep):
                         parts=current_user_parts,
                         a2a_task_id=target_a2a_task_id,
                         role="user",
+                        **sent_clock,
                     )
                     # Turn 0 of a prompt-mode step re-sends exactly the text already
                     # persisted as PromptResponse.prompt_text; store a None placeholder
@@ -571,6 +654,7 @@ class PromptAgentTaskStep(TaskStep):
                     conversation_id=conversation_id,
                     parts=agent_response_parts,
                     role="agent",
+                    **(await self._env_clock_kwargs(clock_envs)),
                 )
 
                 if traj_ext_cached:
@@ -604,7 +688,16 @@ class PromptAgentTaskStep(TaskStep):
                 if series is not None:
                     await series.capture_turn(context, turn + 1)
 
-                if trig_ext and triggers_registered:
+                if advance is not None:
+                    event = await self._advance_to_next_env_event(context, advance)
+                    (context.metadata.setdefault("env_event_advances", {})
+                        .setdefault(self.id, []).append({"turn": turn + 1, **event}))
+                    if "stopped" in event:
+                        logger.info(f"Turn {turn+1}: no further env event ({event['stopped']}); ending multi-turn")
+                        conversation_store.mark_closed(conversation_id)
+                        break
+
+                if trig_ext and triggers_registered and (advance is None or advance["wake"] == "decide"):
                     env_triggers = await self._read_env_triggers(context)
                     (context.metadata.setdefault("env_trigger_snapshots", {})
                         .setdefault(self.id, []).append({"turn": turn + 1, "envs": env_triggers}))
@@ -622,6 +715,12 @@ class PromptAgentTaskStep(TaskStep):
                         current_user_parts = resp.get("parts") or []
                         continue
                     # no trigger fired -> fall through to the LLM user-sim for this turn (hybrid)
+
+                if advance is not None:
+                    text = advance["wake_message"].format(virtual_time=event["mark"],
+                                                          trigger_ids=", ".join(event["trigger_ids"]))
+                    current_user_parts = [{"kind": "text", "text": text}]
+                    continue
 
                 user_a2a_task_id = uuid.uuid4().hex
                 try:
@@ -844,6 +943,91 @@ class PromptAgentTaskStep(TaskStep):
             if resp.status_code >= 400:
                 raise RuntimeError(f"agent-trigger /decide failed (HTTP {resp.status_code}): {resp.text}")
             return resp.json()
+
+    async def _env_clock_kwargs(self, envs: Optional[list]) -> dict:
+        """``{"env_clock": {env_id: virtual_time or None}}`` for a conversation message, or {} when not recording."""
+        if envs is None:
+            return {}
+        states = await asyncio.gather(*(self._get_clock_state(d) for d in envs))
+        return {"env_clock": {d.env_id: (s or {}).get("virtual_time") if (s or {}).get("armed") else None
+                              for d, s in zip(envs, states)}}
+
+    async def _advance_to_next_env_event(self, context: TaskStepContext, advance: dict) -> dict:
+        """Move armed env clocks to the earliest pending time-trigger mark and await its triggers; ``stopped`` once none is due."""
+        envs = []
+        for d in context.deployed_envs:
+            if not (d.supports(EXT_TRIGGERS_URI, "state") and d.supports(EXT_CLOCK_URI, "state")):
+                continue
+            clock = await self._get_clock_state(d)
+            if clock and clock.get("armed"):
+                envs.append((d, clock, (await self._get_trigger_state(d)).get("triggers", [])))
+        pending = [(_utc(t["next_mark"]), d, t) for d, _, rows in envs for t in rows
+                   if t.get("type") == "time" and t.get("status") == "armed" and t.get("next_mark")]
+        if not envs:
+            return {"stopped": "no_armed_env_clock", "virtual_time": None}
+        end = _utc(advance["end_time"]) if advance["end_time"] else None
+        mark = min((m for m, _, _ in pending), default=None)
+        if mark is None or (end is not None and mark > end):
+            if end is not None:
+                await self._move_env_clocks(envs, end, check_marks=False)
+            return {"stopped": "end_time" if mark is not None else "no_pending_time_triggers",
+                    "virtual_time": _iso(end) if end is not None else None}
+        due = [(d, t) for m, d, t in pending if m == mark]
+        moved = await self._move_env_clocks(envs, mark, check_marks=True)
+        statuses = await self._wait_fired(context, due, advance["fire_timeout_seconds"])
+        return {"mark": _iso(mark), "trigger_ids": [t["id"] for _, t in due], "statuses": statuses, "moved": moved}
+
+    async def _move_env_clocks(self, envs: list, target: datetime, *, check_marks: bool) -> dict:
+        """Bring each env clock behind ``target`` up to it, by advance where offered, else a re-arm only fixed marks survive."""
+        moved = {}
+        for d, clock, rows in envs:
+            if _utc(clock["virtual_time"]) >= target:
+                continue
+            if d.supports(EXT_CLOCK_URI, "advance"):
+                await d.invoke(EXT_CLOCK_URI, "advance", {"virtual_time": _iso(target)}, timeout=15)
+                moved[d.env_id] = "advance"
+                continue
+            unsafe = [t["id"] for t in rows if check_marks and t.get("type") == "time"
+                      and t.get("status") == "armed" and not _rearm_safe(t.get("when") or {})]
+            if unsafe:
+                raise RuntimeError(f"{self.id}: env '{d.env_id}' has no clock advance, and a re-arm would re-anchor the "
+                                   f"relative or recurring time trigger(s) {unsafe}; give them absolute marks")
+            await d.invoke(EXT_CLOCK_URI, "set_time", {"virtual_time": _iso(target), "virtual_seconds_per_real_second":
+                                                       clock.get("virtual_seconds_per_real_second", 1.0)}, timeout=15)
+            moved[d.env_id] = "set_time"
+        return moved
+
+    async def _wait_fired(self, context: TaskStepContext, due: list, timeout_seconds: float) -> dict:
+        """Each due trigger's outcome once it has fired, failed or been cancelled; "timeout" for one still unsettled."""
+        before = {t["id"]: (t.get("fire_count") or 0, t.get("failure_count") or 0) for _, t in due}
+        by_env: dict[str, tuple[Any, list[str]]] = {}
+        for d, t in due:
+            by_env.setdefault(d.env_id, (d, []))[1].append(t["id"])
+        outcome: dict[str, str] = {}
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            for d, ids in by_env.values():
+                rows = {t["id"]: t for t in (await self._get_trigger_state(d)).get("triggers", [])}
+                for tid in (i for i in ids if i not in outcome):
+                    row = rows.get(tid)
+                    fires, failures = before[tid]
+                    if row is None:
+                        outcome[tid] = "removed"
+                    elif row.get("status") in TRIGGER_IN_FLIGHT_STATUSES:
+                        continue
+                    elif (row.get("failure_count") or 0) > failures:
+                        outcome[tid] = "failed"
+                    elif (row.get("fire_count") or 0) > fires or row.get("status") in _SETTLED_STATUSES:
+                        outcome[tid] = "fired" if row.get("status") == "armed" else row["status"]
+            if len(outcome) == len(due) or time.monotonic() >= deadline:
+                break
+            context.heartbeat()
+            await asyncio.sleep(_FIRE_POLL_SECONDS)
+        for _, t in due:
+            if t["id"] not in outcome:
+                logger.warning(f"{self.id}: time trigger '{t['id']}' had not settled {timeout_seconds}s after its mark")
+                outcome[t["id"]] = "timeout"
+        return outcome
 
     _CAPTURE_BUDGET_SECONDS: ClassVar[float] = 90
 
