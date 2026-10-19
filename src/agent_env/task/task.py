@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
+from agent_env.config import run_env_ids
 from agent_env.plugins import _registration
 from agent_env.store.document_store import UnknownDocumentTypeError
 from agent_env.store.routing import run_scope
@@ -415,7 +416,7 @@ class Task:
         context.metadata['failed_steps']. The run is scoped to this task's id, so under namespace
         routing an ``@local`` task's records stay in the local stores.
         """
-        with run_scope(self.id):
+        with run_scope(self.id), run_env_ids((context.metadata.get("user_overrides") or {}) if context else {}):
             return await self._run(
                 on_step_start, on_step_complete, agent_model, agent_artifact_id,
                 start_step, end_step, context, instance_id,

@@ -573,7 +573,7 @@ class EnvironmentGatewayProvider(_SandboxEnvironmentProvider):
 
         A MultiEnv's gateway fronts its MCP servers and websites, a WebsiteEnv's its website, and any other env's its one MCP server.
         """
-        from agent_env.config import get_config
+        from agent_env.config import get_config, service_db_env_id
         from agent_env.env.env import Env
         from agent_env.providers.env_state import LOCAL_POSTGRES_STATE_TYPE, acquire_state_for_deploy
 
@@ -582,7 +582,7 @@ class EnvironmentGatewayProvider(_SandboxEnvironmentProvider):
             env_state_type=env_state_type, ttl_seconds=ttl_seconds, name_hint=env.id, env_state_instance_id=env_state_instance_id,
         )
         if state_instance is None or state_instance.state_type == LOCAL_POSTGRES_STATE_TYPE:
-            Env.get(get_config().default_service_db_env_id)  # the local store runs from it: check it before any sandbox
+            Env.get(service_db_env_id(get_config()))  # the local store runs from it: check it before any sandbox
         deployed = await self._launch(
             sandbox_provider, env.id, state_instance=state_instance, mcp_servers=topology.mcp_servers,
             mcp_server_images=topology.mcp_server_images, website_configs=topology.website_configs,
@@ -706,14 +706,14 @@ class EnvironmentGatewayProvider(_SandboxEnvironmentProvider):
         mcp_server_name: str | None = None,
     ) -> DeployedGateway:
         from agent_env.env.env import Env
-        from agent_env.config import get_config
+        from agent_env.config import gateway_env_id, get_config
 
         website_configs = website_configs or []
         website_images = website_images or []
         sidecars = sidecars or []
 
         config = get_config()
-        gateway_env = Env.get(config.default_gateway_env_id)
+        gateway_env = Env.get(gateway_env_id(config))
 
         # Auto-include website_browser MCP server when websites are present
         if website_configs:
@@ -910,10 +910,9 @@ COMPOSE_EOF'''
         mcp_server_name: str | None = None,
     ) -> DeployedGateway:
         from agent_env.env.env import Env
-        from agent_env.config import get_config
+        from agent_env.config import gateway_env_id, get_config
 
-        config = get_config()
-        gateway_env = Env.get(config.default_gateway_env_id)
+        gateway_env = Env.get(gateway_env_id(get_config()))
         # Each image is checked, and prepared (one the provider can't pull, built from its build context), before
         # anything is created, so an image the provider can't run, or a failed build, leaves nothing.
         images = [gateway_env.docker_image_artifact, *mcp_server_images]

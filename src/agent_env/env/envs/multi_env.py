@@ -574,7 +574,7 @@ class MultiEnv(Env):
         from agent_env.env.envs.service_db import DATABASE_SERVICE_NAME, DB_MCP_SERVICE_NAME, PGWEB_SERVICE_NAME
         from agent_env.providers.env_providers.constants import DOCKER_COMPOSE_PATH, GATEWAY_APP_DIR, GATEWAY_SERVICE_NAME
         from agent_env.providers.env_state import LocalPostgresStateProvider
-        from agent_env.config import get_config
+        from agent_env.config import gateway_env_id, get_config, service_db_env_id
 
         if self._sandbox is None:
             raise RuntimeError("Environment not deployed - call deploy() first")
@@ -589,8 +589,8 @@ class MultiEnv(Env):
         # Regenerate docker-compose.yml with the snapshot image (no init-schemas volume needed)
         logger.info("Regenerating docker-compose.yml with snapshot image...")
         config = get_config()
-        gateway_env = Env.get(config.default_gateway_env_id)
-        service_db = Env.get(config.default_service_db_env_id)
+        gateway_env = Env.get(gateway_env_id(config))
+        service_db = Env.get(service_db_env_id(config))
         service_db_config = service_db.to_config()
         service_db_config.db_image = db_image.image_name
 
