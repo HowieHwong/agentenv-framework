@@ -112,7 +112,7 @@ async def test_an_episodes_env_on_modal_is_played_from_this_machine_and_no_endin
 
         forgotten = await start(EpisodeSpec.from_task(task, turn_timeout=3))
         await forgotten.next_turn()
-        with pytest.raises(TimeoutError, match="wasn't ended within 3s"):
+        with pytest.raises(TimeoutError, match="did not complete within 3s"):
             await forgotten.next_turn()
 
         for episode in (played, abandoned, forgotten):

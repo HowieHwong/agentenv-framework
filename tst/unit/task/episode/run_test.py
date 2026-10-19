@@ -1,12 +1,14 @@
 """The run of an episode, on fake steps: its turns, its scores, abandoning it, teardown and its record."""
 
 import asyncio
+import json
 
 import pytest
 import pytest_asyncio
 from agentenv_protocol import EnvironmentTool, ToolResult
 
 import agent_env.task.episode.run as episode_run
+from agent_env.config import get_config
 from agent_env.config.runtime import Config
 from agent_env.env.env import DeployedEnv
 from agent_env.task import EpisodeError, EpisodeSpec, Task
@@ -156,7 +158,7 @@ ITEMS = {"id": "items", "type": "episode_test_env"}
 ALICE = {"id": "alice", "type": "deploy_agent", "agent_name": "alice", "env_ids": ["items"],
          "role": "alice@example.com", "system_prompt": "You keep the items."}
 TURN = {"id": "turn", "type": "prompt_agent", "agent_name": "alice", "prompt_id": "turn", "prompt": "Add a crate.",
-        "timeout_seconds": 5}
+        "timeout_seconds": 5, "poll_interval_seconds": 0.05}
 REPLIES = {"id": "replies", "type": "episode_test_replies", "verifier_id": "replies"}
 
 
@@ -194,7 +196,8 @@ async def test_the_run_waits_at_an_outside_turn_and_carries_on_once_it_ends(tear
     assert record.context["metadata"]["episode"] == {"id": episode.id, "trainer_agents": ["alice"]}
     assert [(r["step_id"], r["prompt_text"], r["response"]) for r in record.context["prompt_responses"]] == [
         ("turn", "Add a crate.", "Added a crate.")]
-    assert record.context["deployed_agents"] == []
+    assert [(agent["agent_name"], agent["sandbox_id"]) for agent in record.context["deployed_agents"]] == [
+        ("alice", None)]
 
 
 @pytest.mark.asyncio
@@ -322,32 +325,32 @@ async def test_a_setup_failure_reaches_the_caller_waiting_for_a_turn(teardowns):
 
 @pytest.mark.asyncio
 async def test_a_turn_not_taken_by_its_deadline_fails_the_run_and_is_never_handed_out(teardowns):
-    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05}, REPLIES).start()
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 1}, REPLIES).start()
     await _ended(episode)
 
-    with pytest.raises(TimeoutError, match="turn 'turn' of agent 'alice' wasn't ended within 0.05s"):
+    with pytest.raises(TimeoutError, match="did not complete within 1s"):
         await episode.next_turn()
     assert Task.get_instance(episode.id).status == "failed"
 
 
 @pytest.mark.asyncio
 async def test_a_turn_ended_after_its_deadline_changes_nothing(teardowns):
-    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.5}, REPLIES).start()
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 1}, REPLIES).start()
     turn = await episode.next_turn()
     await _ended(episode)
 
     await turn.end("too late")
 
-    with pytest.raises(TimeoutError, match="wasn't ended within 0.5s"):
+    with pytest.raises(TimeoutError, match="did not complete within 1s"):
         await episode.result()
     record = Task.get_instance(episode.id)
-    assert record.status == "failed" and "wasn't ended within 0.5s" in record.error
+    assert record.status == "failed" and "did not complete within 1s" in record.error
     assert record.context["prompt_responses"] == []
 
 
 @pytest.mark.asyncio
 async def test_a_tolerant_turn_past_its_deadline_is_scored_without_a_reply(teardowns):
-    tolerant = {**TURN, "timeout_seconds": 0.05, "fail_task_on_error": False}
+    tolerant = {**TURN, "timeout_seconds": 1, "fail_task_on_error": False}
     episode = await _spec(ITEMS, ALICE, tolerant, REPLIES).start()
     await _ended(episode)
 
@@ -586,3 +589,95 @@ async def test_a_cancelled_start_takes_its_run_down_with_it(teardowns):
 
     assert not episode_run._live
     assert teardowns.finished == teardowns.started and len(teardowns.finished) == 1
+
+
+class _SandboxedStandIn:
+    """Stands in for the client of a stand-in deployed in a sandbox: runs each command as ``ran <command>``, and
+    records each reply."""
+
+    def __init__(self):
+        self.commands = []
+        self.replies = []
+
+    async def run(self, command):
+        self.commands.append(command)
+        return f"ran {command}"
+
+    async def reply(self, task_id, **reply):
+        self.replies.append((task_id, reply))
+        return True
+
+
+def _sandboxed_turn(stand_in):
+    return episode_run.Turn(agent="alice", step_id="turn", prompt="Add a crate.", system_prompt=None, role=None,
+                            mcp_urls={"items": ITEMS_MCP}, skills=[], shell=True, stand_in=stand_in, task_id="t-1")
+
+
+@pytest.mark.asyncio
+async def test_a_turn_in_the_agents_sandbox_offers_bash_beside_its_envs_tools(monkeypatch):
+    _tool_sessions(monkeypatch, {ITEMS_MCP: ["items_add_item"]})
+    stand_in = _SandboxedStandIn()
+
+    async with _sandboxed_turn(stand_in).tools() as tools:
+        assert [tool.name for tool in tools.list()] == ["items_add_item", "bash"]
+        assert (await tools.call("bash", {"command": "ls inputs"})).text == "ran ls inputs"
+        with pytest.raises(EpisodeError, match="tool 'bash' takes a command string, not 3"):
+            await tools.call("bash", {"command": 3})
+
+    assert stand_in.commands == ["ls inputs"]
+
+
+@pytest.mark.asyncio
+async def test_an_env_tool_named_bash_clashes_with_the_sandboxes_own(monkeypatch):
+    _tool_sessions(monkeypatch, {ITEMS_MCP: ["bash"]})
+
+    with pytest.raises(EpisodeError, match="tool 'bash' is offered by env 'items', and the agent's sandbox offers"):
+        async with _sandboxed_turn(_SandboxedStandIn()).tools():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_turns_calls_and_its_reply_are_handed_back_as_its_trajectory(monkeypatch):
+    _tool_sessions(monkeypatch, {ITEMS_MCP: ["items_add_item"]})
+    stand_in = _SandboxedStandIn()
+    turn = _sandboxed_turn(stand_in)
+
+    async with turn.tools() as tools:
+        await tools.call("items_add_item", {"name": "crate"})
+        await tools.call("bash", {"command": "ls"})
+    await turn.end("Added a crate.")
+
+    [(task_id, reply)] = stand_in.replies
+    assert (task_id, reply["text"], reply["tool_call_count"]) == ("t-1", "Added a crate.", 2)
+    spans = reply["trajectory"]
+    assert [(span["name"], span["attributes"]["gen_ai.operation.name"]) for span in spans] == [
+        ("items_add_item", "execute_tool"), ("bash", "execute_tool"), ("turn", "chain")]
+    assert json.loads(spans[0]["attributes"]["gen_ai.prompt"]) == {"input": {"name": "crate"}}
+    assert json.loads(spans[1]["attributes"]["gen_ai.completion"]) == {"output": [{"type": "text", "text": "ran ls"}]}
+    assert json.loads(spans[2]["attributes"]["gen_ai.completion"]) == {
+        "content": [{"type": "text", "text": "Added a crate."}]}
+    assert all(span["start_time"] <= span["end_time"] for span in spans)
+
+
+@pytest.mark.asyncio
+async def test_the_turns_trajectory_is_stored_as_any_agents_is(teardowns, monkeypatch):
+    _tool_sessions(monkeypatch, {ITEMS_MCP: ["items_add_item"]})
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    turn = await episode.next_turn()
+
+    async with turn.tools() as tools:
+        await tools.call("items_add_item", {"name": "crate"})
+    await turn.end("Added a crate.")
+    await episode.result()
+
+    [response] = Task.get_instance(episode.id).context["prompt_responses"]
+    stored = json.loads(get_config().get_object_store().get(response["agent_trajectory_object_url"]))
+    assert [span["name"] for span in stored] == ["items_add_item", "turn"]
+    assert response["tool_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_prompts_own_system_prompt_wins_over_the_agents(teardowns):
+    episode = await _spec(ITEMS, ALICE, {**TURN, "system_prompt": "Count first."}, REPLIES).start()
+
+    assert (await episode.next_turn()).system_prompt == "Count first."

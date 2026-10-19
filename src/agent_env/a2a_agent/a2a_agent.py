@@ -63,6 +63,7 @@ _DIND_IMAGE = (
 _DIND_CONTAINER = "agent-dind"
 _DIND_NETWORK = "agent-docker-net"
 _DIND_PORT = 2375
+SHARE_STORE_CREDENTIALS = "share_store_credentials"
 
 
 def unwritten_local_agent(agent_id: str, field: str) -> str:
@@ -549,7 +550,7 @@ class A2AAgent:
         merged_env.update(resolved_env)
         merged_env["A2A_PORT"] = str(a2a_port)
         shared = get_config().get_object_store().shared_credentials_env()
-        if shared.keys().isdisjoint(merged_env):
+        if self.metadata.get(SHARE_STORE_CREDENTIALS, True) and shared.keys().isdisjoint(merged_env):
             merged_env.update(shared)
 
         merged_env.update(all_sandbox_container_env())
