@@ -744,6 +744,13 @@ async def test_recovered_failure_is_marked_retried(store):
     assert all(f.get("retried") for f in fs)
 
 
+@pytest.mark.asyncio
+async def test_a_run_drops_the_recorded_failures_of_the_steps_it_runs_again(store):
+    context = TaskStepContext(metadata={"failed_steps": [{"step_id": "s0", "error": "earlier"}, {"step_id": "x"}]})
+    await Task(id="t", version=1, steps=[_FakeDeployEnv("s0")]).run(context=context)
+    assert context.metadata["failed_steps"] == [{"step_id": "x"}]
+
+
 def test_rolled_back_sandboxes_is_the_difference_between_stored_and_replayed():
     before = {
         "deployed_envs": [

@@ -472,6 +472,10 @@ class Task:
             context.agent_model = agent_model
         if agent_artifact_id is not None:
             context.agent_artifact_id = agent_artifact_id
+        rerun = {step.id for step in steps[start_step:end_step]}
+        if context.metadata.get("failed_steps"):
+            context.metadata["failed_steps"] = [
+                f for f in context.metadata["failed_steps"] if not (isinstance(f, dict) and f.get("step_id") in rerun)]
 
         # Pre-format a bracketed prefix for pass@k-correlated log lines.
         # agent-env's log pipeline doesn't index ad-hoc `key=value` fields, so
