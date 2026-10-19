@@ -39,9 +39,9 @@ def _stream_run() -> str:
 def test_stream_json_pairs_each_call_with_its_result_by_id_in_run_order():
     t = FS.transcript_from_raw(_stream_run())
     assert [(a.index, a.tool, a.args) for a in t.actions] == [
-        (1, "mcp__gw__linear_get_issue", {"id": "ENG-1"}),
-        (2, "mcp__gw__linear_update_issue", {"id": "ENG-1", "state": "Done"}),
-        (3, "mcp__gw__gmail_send", {"to": "a@b.c"})]
+        (1, "linear_get_issue", {"id": "ENG-1"}),
+        (2, "linear_update_issue", {"id": "ENG-1", "state": "Done"}),
+        (3, "gmail_send", {"to": "a@b.c"})]
     assert t.actions[0].result == '{"state": "Todo"}\n<image>'
     assert t.actions[1].result == {"error": "permission denied"}
     assert t.actions[2].result is None and all(a.screenshot is None for a in t.actions)
@@ -52,10 +52,10 @@ def test_stream_json_action_log_shows_calls_results_and_the_agent_text():
     t = FS.transcript_from_raw(_stream_run())
     lines = FS.action_log(t.actions, messages=t.messages).splitlines()
     assert lines[0] == 'agent said: "Looking up the issue first."'
-    assert lines[1].startswith('1. mcp__gw__linear_get_issue {"id": "ENG-1"} -> ')
-    assert lines[2] == ('2. mcp__gw__linear_update_issue {"id": "ENG-1", "state": "Done"}'
+    assert lines[1].startswith('1. linear_get_issue {"id": "ENG-1"} -> ')
+    assert lines[2] == ('2. linear_update_issue {"id": "ENG-1", "state": "Done"}'
                         ' -> {"error": "permission denied"}')
-    assert lines[3] == '3. mcp__gw__gmail_send {"to": "a@b.c"}' and "Updated ENG-1" not in "\n".join(lines)
+    assert lines[3] == '3. gmail_send {"to": "a@b.c"}' and "Updated ENG-1" not in "\n".join(lines)
 
 
 def _part(pid: str, tool: str, state: dict) -> dict:
@@ -89,6 +89,30 @@ def test_an_empty_stream_json_result_is_kept_apart_from_no_result():
     first, second = FS.transcript_from_raw(raw).actions
     assert first.result == [] and second.result is None
     assert "search" in FS.action_log([first]) and "-> []" in FS.action_log([first])
+
+
+def test_claude_mcp_tool_names_drop_the_server_alias_and_builtin_tools_keep_theirs():
+    raw = json.dumps([_assistant(_use("t1", "mcp__env7948__slack_post", {}), _use("t2", "mcp__hg__slack_post", {}),
+                                 _use("t3", "Bash", {"command": "ls"}), _use("t4", "mcp__odd__", {}))])
+    assert [a.tool for a in FS.transcript_from_raw(raw).actions] == ["slack_post", "slack_post", "Bash", "mcp__odd__"]
+
+
+def test_other_cli_stream_formats_are_not_read_as_an_empty_claude_run():
+    gemini = json.dumps([{"type": "init", "session_id": "s1", "model": "m"},
+                         {"type": "message", "role": "assistant", "content": "Checking.", "delta": True},
+                         {"type": "tool_use", "tool_name": "search", "tool_id": "t1", "parameters": {"q": "x"}},
+                         {"type": "tool_result", "tool_id": "t1", "status": "success", "output": "1 hit"},
+                         {"type": "result", "status": "success", "stats": {}}])
+    codex = json.dumps([{"type": "thread.started", "thread_id": "th1"},
+                        {"type": "item.completed", "item": {"type": "agent_message", "text": "Done."}}])
+    for raw in (gemini, codex):
+        assert FS.transcript_from_raw(raw).source is None
+
+
+def test_a_claude_run_that_stopped_before_its_first_turn_is_still_a_claude_run():
+    raw = json.dumps([{"type": "system", "subtype": "init"}, {"type": "result", "is_error": True}])
+    t = FS.transcript_from_raw(raw)
+    assert t.source == "stream-json" and t == FS.Transcript([], [])
 
 
 def test_unrecognised_lists_still_give_an_empty_transcript():

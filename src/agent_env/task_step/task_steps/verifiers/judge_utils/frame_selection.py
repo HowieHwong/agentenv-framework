@@ -30,10 +30,11 @@ from agent_env.task_step.task_steps.verifiers.judge_utils.trajectory_filter impo
 MAX_ARGS_CHARS = DEFAULT_ACTION_LOG_MAX_ARGS_CHARS
 MAX_RESULT_CHARS = DEFAULT_ACTION_LOG_MAX_RESULT_CHARS
 MAX_AGENT_MESSAGE_CHARS = 200
-# Row types of a coding-agent CLI's stream-json event list.
-_STREAM_JSON_TYPES = frozenset({"system", "assistant", "user", "result"})
 # The per-server prefix some CLIs put on MCP tool names: random hex that carries no meaning.
 _HEX_TOOL_PREFIX = re.compile(r"^mcp_[0-9a-f]+_")
+# Claude Code's MCP tool names, ``mcp__<server>__<tool>``: the server is an alias, often random per deploy
+# (``env7948``), so the same tool would be named differently in every run.
+_CLAUDE_MCP_PREFIX = re.compile(r"^mcp__.+?__(?=.)")
 # Replaces a base64 image payload in rendered text before any cut, so the cut lands on text.
 _IMAGE_PLACEHOLDER = "<image>"
 # A second candidate scoring at least this fraction of a criterion's best match is kept as a near-tie.
@@ -126,11 +127,19 @@ def transcript_from_raw(raw_text: str) -> Transcript:
     dicts = [r for r in rows if isinstance(r, dict)]
     if any(isinstance(r.get("attributes"), dict) for r in dicts):
         return replace(_transcript_from_otel(dicts), source="otel")
-    if any(r.get("type") in _STREAM_JSON_TYPES for r in dicts):
+    if any(_is_claude_stream_row(r) for r in dicts):
         return replace(_transcript_from_stream_json(dicts), source="stream-json")
     if any(isinstance(r.get("part"), dict) for r in dicts):
         return replace(_transcript_from_opencode(dicts), source="opencode")
     return Transcript([], [])
+
+
+def _is_claude_stream_row(row: dict) -> bool:
+    """A row only Claude Code's stream-json writes: a ``system`` row, or an assistant / user turn whose
+    ``message`` is an object. Other CLIs share some row types (Gemini also closes on ``{"type": "result"}``)
+    but not these, and must not be read as an empty Claude run."""
+    kind = row.get("type")
+    return kind == "system" or (kind in ("assistant", "user") and isinstance(row.get("message"), dict))
 
 
 def _decoded(value: object, depth: int = 3) -> object:
@@ -189,7 +198,7 @@ def _transcript_from_stream_json(rows: list[dict]) -> Transcript:
             elif row.get("type") == "assistant" and kind == "tool_use":
                 args = block.get("input") if isinstance(block.get("input"), dict) else {}
                 position[str(block.get("id"))] = len(actions)
-                actions.append(TrajectoryAction(index=len(actions) + 1, tool=str(block.get("name") or ""),
+                actions.append(TrajectoryAction(index=len(actions) + 1, tool=_CLAUDE_MCP_PREFIX.sub("", str(block.get("name") or "")),
                                                 args=args, screenshot=None))
             elif row.get("type") == "user" and kind == "tool_result" and str(block.get("tool_use_id")) in position:
                 i = position[str(block["tool_use_id"])]
