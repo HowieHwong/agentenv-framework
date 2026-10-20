@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import subprocess
 import time
 from typing import Any
 
@@ -53,6 +53,18 @@ def _ran(client: TestClient, command: str) -> str:
     while not (result := _driver(client, "output", exec_id=exec_id).json())["done"]:
         pass
     return result["output"]
+
+
+def _stopped(pid: int) -> None:
+    """Until ``pid`` is gone, or a zombie: a killed child whose parent has gone stays one until what adopted it reaps it."""
+    deadline = time.monotonic() + 10
+    while (state := _state(pid)) and not state.startswith("Z"):
+        assert time.monotonic() < deadline, state
+        time.sleep(0.02)
+
+
+def _state(pid: int) -> str:
+    return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
 
 
 @pytest.fixture
@@ -157,8 +169,7 @@ def test_a_command_that_outlives_its_timeout_is_stopped_with_what_it_started(cli
     output = _ran(client, "sleep 60 & echo $! > child; wait")
 
     assert output == "error: the command timed out after 0.5s"
-    with pytest.raises(ProcessLookupError):
-        os.kill(int((tmp_path / "child").read_text()), 0)
+    _stopped(int((tmp_path / "child").read_text()))
 
 
 def test_a_child_left_holding_the_output_is_stopped_when_the_command_times_out(client, monkeypatch, tmp_path):
@@ -167,8 +178,7 @@ def test_a_child_left_holding_the_output_is_stopped_when_the_command_times_out(c
     output = _ran(client, "sleep 60 & echo $! > child")
 
     assert output == "error: the command timed out after 0.5s"
-    with pytest.raises(ProcessLookupError):
-        os.kill(int((tmp_path / "child").read_text()), 0)
+    _stopped(int((tmp_path / "child").read_text()))
 
 
 def test_output_names_a_command_it_started(client):
