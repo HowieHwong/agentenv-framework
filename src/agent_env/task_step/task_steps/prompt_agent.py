@@ -121,6 +121,7 @@ DEFAULT_WAKE_MESSAGE = "[{virtual_time}] Time has passed. Check for anything new
 _BETWEEN_TURNS_KEYS = ("mode", "wake", "wake_message", "end_time", "fire_timeout_seconds")
 _WAKES = ("message", "decide")
 _SETTLED_STATUSES = ("fired", "failed", "cancelled")
+_SCHEDULED_STATUSES = ("armed", *TRIGGER_IN_FLIGHT_STATUSES)
 _FIRE_POLL_SECONDS = 0.5
 
 
@@ -962,7 +963,7 @@ class PromptAgentTaskStep(TaskStep):
             if clock and clock.get("armed"):
                 envs.append((d, clock, (await self._get_trigger_state(d)).get("triggers", [])))
         pending = [(_utc(t["next_mark"]), d, t) for d, _, rows in envs for t in rows
-                   if t.get("type") == "time" and t.get("status") == "armed" and t.get("next_mark")]
+                   if t.get("type") == "time" and t.get("status") in _SCHEDULED_STATUSES and t.get("next_mark")]
         if not envs:
             return {"stopped": "no_armed_env_clock", "virtual_time": None}
         end = _utc(advance["end_time"]) if advance["end_time"] else None
@@ -988,7 +989,7 @@ class PromptAgentTaskStep(TaskStep):
                 moved[d.env_id] = await self._advance_clock(d, target)
                 continue
             unsafe = [t["id"] for t in rows if check_marks and t.get("type") == "time"
-                      and t.get("status") == "armed" and not _rearm_safe(t.get("when") or {})]
+                      and t.get("status") in _SCHEDULED_STATUSES and not _rearm_safe(t.get("when") or {})]
             if unsafe:
                 raise RuntimeError(f"{self.id}: env '{d.env_id}' has no clock advance, and a re-arm would re-anchor the "
                                    f"relative or recurring time trigger(s) {unsafe}; give them absolute marks")
