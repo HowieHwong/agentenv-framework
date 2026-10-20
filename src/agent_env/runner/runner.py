@@ -55,6 +55,7 @@ class RunRecord:
     finished_at_utc: Optional[str] = None
     error: Optional[str] = None
     overrides: dict[str, Any] = field(default_factory=dict)
+    owner: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -69,6 +70,7 @@ class RunRecord:
             "finished_at_utc": self.finished_at_utc,
             "error": self.error,
             "overrides": self.overrides,
+            "owner": self.owner,
         }
 
     @classmethod
@@ -85,6 +87,7 @@ class RunRecord:
             finished_at_utc=data.get("finished_at_utc"),
             error=data.get("error"),
             overrides=data.get("overrides") or {},
+            owner=data.get("owner"),
         )
 
 
@@ -132,3 +135,16 @@ class Runner(ABC):
 
     async def stop(self) -> None:
         """Stop processing and release resources."""
+
+
+def run_outcome(context: Any, exc: Optional[BaseException] = None) -> tuple[RunStatus, Optional[str]]:
+    """How a finished ``Task.run()`` ended, with its error: FAILED if it raised ``exc``, else FAILED if a failed step
+    on the context was not retried (one with ``fail_task_on_error`` off fails without raising; a malformed entry
+    counts), else COMPLETED. Every runner records a run's end by this rule."""
+    if exc is not None:
+        return RunStatus.FAILED, f"{type(exc).__name__}: {exc}"
+    failed = [
+        f for f in (context.metadata or {}).get("failed_steps") or []
+        if not (isinstance(f, dict) and f.get("retried"))
+    ]
+    return (RunStatus.FAILED, str(failed)) if failed else (RunStatus.COMPLETED, None)

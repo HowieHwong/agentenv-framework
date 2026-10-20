@@ -78,7 +78,7 @@ _HUMAN_A2A_CONFIG_SECTION = "conversations"
 _HUMAN_A2A_CONFIG_KEY = "default_human_a2a_url"
 _AGENTS_CONFIG_SECTION = "agents"
 _AGENTS_CONFIG_KEY = "default_a2a_agent_id"
-_DEFAULT_A2A_AGENT_ID = "a2a-default"
+_DEFAULT_A2A_AGENT_ID = "@local/agentenv-framework/agents/claude-code"  # the agents bundle's Claude Code
 
 
 def _validated_human_a2a_url(value: object, source: str) -> str:
@@ -139,8 +139,8 @@ class ResolvedKey:
 
 
 RESOLVED_KEYS: tuple[ResolvedKey, ...] = (
-    ResolvedKey(("model", "api_key"), env_var="LITELLM_API_KEY"),
-    ResolvedKey(("model", "base_url"), env_var="LITELLM_BASE_URL"),
+    ResolvedKey(("model", "api_key"), env_var=model_config.ENV_API_KEY),
+    ResolvedKey(("model", "base_url"), env_var=model_config.ENV_BASE_URL),
     ResolvedKey(("conversations", "default_human_a2a_url"),
                 env_var="AGENT_ENV_HUMAN_A2A_URL", field="default_human_a2a_url"),
     ResolvedKey(("agents", "default_a2a_agent_id"), field="default_a2a_agent_id",
@@ -386,7 +386,7 @@ class Config:
 
     def get_default_a2a_agent_id(self) -> str:
         """The agent a ``deploy_agent`` step without an id deploys:
-        ``configure(default_a2a_agent_id=...)`` > ``[agents] default_a2a_agent_id`` > ``a2a-default``."""
+        ``configure(default_a2a_agent_id=...)`` > ``[agents] default_a2a_agent_id`` > the agents bundle's Claude Code."""
         key = _KEY_BY_NAME[f"{_AGENTS_CONFIG_SECTION}.{_AGENTS_CONFIG_KEY}"]
         for layer in self.key_candidates(key):
             if layer.kind == KIND_INSTALLED:

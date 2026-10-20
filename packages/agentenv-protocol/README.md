@@ -670,6 +670,21 @@ tools with (agent-env relays the env card's name: the MultiEnv's declared name, 
 `env` + 4 random digits, giving e.g. `mcp__env4821__<tool>`); when absent the agent mints
 `mcp_<8 hex>`.
 
+`PEER_AGENTS_V1` lets an agent delegate to the other agents in its task. AgentEnv
+sets the routing table with `POST /ext/peer-agents` (`{"peers": [{"name", "url",
+"card", "description"}]}`; an empty list clears it, and names must be unique), and
+`GET /ext/peer-agents` returns it. An agent that enables the extension without
+handlers of its own gets the SDK's: the SDK serves six MCP tools, `peer_list`,
+`peer_get_card`, `peer_send_message` (send and wait, for at most 50 s, so a call
+answers within the 60 s MCP clients commonly give a request), `peer_start_task`,
+`peer_get_task` and `peer_cancel_task`, at `/ext/peer-agents/mcp` on the agent's
+own port, and adds them to every task's `request.mcp_servers` as `peer_agents`, so
+a harness that connects the task's MCP servers gives its model the tools with no
+code of its own. The tools wrap the peers' A2A `message/send`, `tasks/get` and
+`tasks/cancel`; they answer loopback callers only, while the application's lifespan
+runs, and the name `peer_agents` is reserved from `MCP_CONFIG_V1.add`. An agent that
+overrides both operations keeps the table itself and gets no tools.
+
 `ATTRIBUTION_PROBE_V1.probe` lets a caller check that an agent forwards attribution
 upstream. Attribution is an open map of string dimensions, like AgentEnv's cost
 attribution: the SDK assigns no keys, and each deployment uses whatever dimensions
