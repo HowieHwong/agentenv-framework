@@ -275,6 +275,8 @@ class Gateway:
                 body = await request.json()
             except Exception:
                 return self._json_response({"ok": False, "error": "Invalid JSON body"}, 400)
+            if not isinstance(body, dict):
+                return self._json_response({"ok": False, "error": "body must be a JSON object"}, 400)
             try:
                 state = self._clock.advance(body.get("virtual_time"))
             except ClockError as e:

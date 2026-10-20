@@ -152,6 +152,9 @@ def test_route_advances_an_armed_clock(gateway):
 @pytest.mark.parametrize("body,fragment", [
     ({"virtual_time": "2026-01-04T08:00:00Z"}, "not armed"),
     ("{not json", "Invalid JSON body"),
+    ("null", "must be a JSON object"),
+    ("[]", "must be a JSON object"),
+    ('"2026-01-04T08:00:00Z"', "must be a JSON object"),
 ])
 def test_route_refuses_with_400(gateway, body, fragment):
     resp = _put(gateway, "/clock/advance", body)
