@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from agent_env.runner import store as run_store
-from agent_env.runner.runner import KEEP_KEY, RunHandle, RunRecord, Runner, RunStatus
+from agent_env.runner.runner import KEEP_KEY, RunHandle, RunRecord, Runner, RunStatus, run_outcome
 from agent_env.task.store import new_instance_id
 from agent_env.task.teardown import TERMINATE_TIMEOUT_SECONDS, teardown_run
 
@@ -272,21 +272,12 @@ class LocalRunner(Runner):
             logger.warning("Run %s: %s is still up", run_id, sandbox.sandbox_id)
 
     def _finish(self, run_id: str, context, *, exc: Optional[BaseException] = None) -> None:
-        """Persist the terminal state of a finished Task.run(): a raised step is FAILED,
-        otherwise an un-retried failed step on the context is authoritative (a step can fail
-        without raising when fail_task_on_error is False). Failures the scheduler recovered via
-        retry carry ``retried`` and don't count, so a run that recovers is COMPLETED."""
-        if exc is not None:
-            run_store.mark_terminal(run_id, RunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
-            logger.warning("Run %s failed: %s", run_id, exc)
-        elif failed := [
-            f for f in (context.metadata or {}).get("failed_steps") or []
-            if not (isinstance(f, dict) and f.get("retried"))   # a malformed entry counts as a failure
-        ]:
-            run_store.mark_terminal(run_id, RunStatus.FAILED, error=str(failed))
-            logger.warning("Run %s finished with failed steps: %s", run_id, failed)
+        """Persist the terminal state of a finished Task.run(), by ``run_outcome``."""
+        status, error = run_outcome(context, exc)
+        run_store.mark_terminal(run_id, status, error=error)
+        if error:
+            logger.warning("Run %s failed: %s", run_id, error)
         else:
-            run_store.mark_terminal(run_id, RunStatus.COMPLETED)
             logger.info("Run %s completed", run_id)
 
     def _seed_context(self, record: RunRecord, stored):
