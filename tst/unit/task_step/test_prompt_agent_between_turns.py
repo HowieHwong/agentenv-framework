@@ -346,6 +346,25 @@ async def test_a_run_with_no_armed_env_clock_ends_after_the_first_turn(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_an_agent_trigger_that_ends_the_run_records_its_message_with_the_env_clock(monkeypatch):
+    async def decide(self, url, turn, message, context_id, env_triggers):
+        return {"fired": ["bye"], "done": True, "parts": [{"kind": "text", "text": "[news] that's all"}]}
+
+    async def readback(self, url, timeout):
+        return httpx.Response(200, json={"firing_log": []}, request=httpx.Request("GET", url))
+
+    seen = _wire(monkeypatch, decide=decide)
+    monkeypatch.setattr(httpx.AsyncClient, "get", readback)
+
+    await _step({"mode": "next_env_event", "wake": "decide"}, user_agent_name="stakeholder").execute(
+        _context(_Env({"school-email": DAY1}), user_sim_triggers=True))
+
+    assert seen["stored"][-1] == ("add", {"parts": [{"kind": "text", "text": "[news] that's all"}],
+                                          "a2a_task_id": seen["stored"][-1][1]["a2a_task_id"], "role": "user",
+                                          "env_clock": {"env-1": DAY1}})
+
+
+@pytest.mark.asyncio
 async def test_wake_decide_without_agent_triggers_is_refused(monkeypatch):
     _wire(monkeypatch)
     with pytest.raises(RuntimeError, match="wake 'decide' needs"):

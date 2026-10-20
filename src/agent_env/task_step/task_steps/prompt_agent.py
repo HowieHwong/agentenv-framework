@@ -709,7 +709,8 @@ class PromptAgentTaskStep(TaskStep):
                     if bool(resp.get("done")):
                         current_user_parts = resp.get("parts") or []
                         conversation_store.add_a2a_task(conversation_id, parts=current_user_parts,
-                                                        a2a_task_id=uuid.uuid4().hex, role="user")
+                                                        a2a_task_id=uuid.uuid4().hex, role="user",
+                                                        **(await self._env_clock_kwargs(clock_envs)))
                         conversation_store.mark_closed(conversation_id)
                         break
                     if resp.get("fired"):
