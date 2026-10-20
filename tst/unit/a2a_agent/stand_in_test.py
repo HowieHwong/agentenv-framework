@@ -1,6 +1,8 @@
 """The stand-in agent the Episode API deploys in place of an agent played from outside: written to the store as an
 image's build context, and written again only when that context changes."""
 
+from importlib.metadata import version
+
 from agent_env.a2a_agent import stand_in
 from agent_env.a2a_agent.a2a_agent import SHARE_STORE_CREDENTIALS
 from agent_env.a2a_agent.stand_in import STAND_IN_AGENT_ID, stand_in_agent
@@ -32,7 +34,7 @@ def test_its_context_holds_the_server_the_protocol_package_and_the_pinned_requir
         "Dockerfile", "a2a_server.py", "agentenv_protocol", "requirements.txt"]
     assert (context / "agentenv_protocol" / "a2a_agent" / "stand_in.py").is_file()
     assert not list(context.rglob("__pycache__"))
-    requirements = (context / "requirements.txt").read_text().splitlines()
-    assert {line.split("==")[0] for line in requirements} == {
-        "a2a-sdk[http-server]", "httpx", "pydantic", "python-multipart", "regex", "starlette", "uvicorn"}
-    assert all(line.split("==")[1] for line in requirements)
+    pinned = dict(line.split("==") for line in (context / "requirements.txt").read_text().splitlines())
+    assert {"a2a-sdk[http-server]", "httpx", "pydantic", "starlette", "uvicorn"} <= pinned.keys()
+    assert not pinned.keys() & {"fastmcp", "pytest", "pytest-asyncio"}
+    assert all(pinned[name] == version(name.split("[")[0]) for name in pinned)
