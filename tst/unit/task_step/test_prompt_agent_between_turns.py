@@ -60,6 +60,8 @@ class _Env:
         if uri == EXT_CLOCK_URI:
             return {"armed": True, "virtual_time": _z(self.now), "virtual_seconds_per_real_second": self.rate}
         for row in self.rows.values():
+            if row.get("stuck"):
+                continue
             if row["status"] == "firing" and self.outcome == "fired":
                 row.update(status="armed", fire_count=row["fire_count"] + 1)
             elif row["status"] == "armed" and row["next_mark"] and _dt(row["next_mark"]) <= self.now:
@@ -278,6 +280,22 @@ async def test_a_recurring_trigger_still_mid_fire_keeps_its_next_mark_in_the_sch
     assert env.moves() == [("advance", {"virtual_time": DAY1}), ("advance", {"virtual_time": "2026-03-04T09:30:00Z"})]
     assert [a.get("trigger_ids") for a in ctx.metadata["env_event_advances"]["watch"]] == [["daily"], ["daily"]]
     assert len(seen["solver"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_recurring_fire_does_not_hold_time_at_its_mark(monkeypatch):
+    seen = _wire(monkeypatch)
+    env = _Env({"later": DAY2})
+    env.rows["daily"] = {"id": "daily", "type": "time", "status": "firing", "next_mark": DAY1, "fire_count": 1,
+                         "failure_count": 0, "when": {"type": "time", "every": "P1D"}, "stuck": True}
+
+    ctx = await _step({"mode": "next_env_event", "fire_timeout_seconds": 0.01}, turns=5).execute(_context(env))
+
+    assert env.moves() == [("advance", {"virtual_time": DAY1}), ("advance", {"virtual_time": DAY2})]
+    advances = ctx.metadata["env_event_advances"]["watch"]
+    assert advances[0]["statuses"] == {"env-1": {"daily": "timeout"}}
+    assert advances[1]["statuses"] == {"env-1": {"later": "fired"}}
+    assert advances[2]["stopped"] == "no_pending_time_triggers" and len(seen["solver"]) == 3
 
 
 @pytest.mark.asyncio

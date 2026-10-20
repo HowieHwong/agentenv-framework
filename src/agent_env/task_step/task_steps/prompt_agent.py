@@ -563,6 +563,7 @@ class PromptAgentTaskStep(TaskStep):
                                f"user simulator with agent triggers registered")
         clock_envs = ([d for d in context.deployed_envs if d.supports(EXT_CLOCK_URI, "state")]
                       if advance is not None or self.record_env_clock else None)
+        timed_out: set[tuple[str, str, str]] = set()
 
         solver_context_id = a2a_context_id
         if self.context_id:
@@ -690,7 +691,7 @@ class PromptAgentTaskStep(TaskStep):
                     await series.capture_turn(context, turn + 1)
 
                 if advance is not None:
-                    event = await self._advance_to_next_env_event(context, advance)
+                    event = await self._advance_to_next_env_event(context, advance, timed_out)
                     (context.metadata.setdefault("env_event_advances", {})
                         .setdefault(self.id, []).append({"turn": turn + 1, **event}))
                     if "stopped" in event:
@@ -954,7 +955,8 @@ class PromptAgentTaskStep(TaskStep):
         return {"env_clock": {d.env_id: (s or {}).get("virtual_time") if (s or {}).get("armed") else None
                               for d, s in zip(envs, states)}}
 
-    async def _advance_to_next_env_event(self, context: TaskStepContext, advance: dict) -> dict:
+    async def _advance_to_next_env_event(self, context: TaskStepContext, advance: dict,
+                                         timed_out: set[tuple[str, str, str]]) -> dict:
         """Move armed env clocks to the earliest pending time-trigger mark and await its triggers; ``stopped`` once none is due."""
         envs = []
         for d in context.deployed_envs:
@@ -964,7 +966,8 @@ class PromptAgentTaskStep(TaskStep):
             if clock and clock.get("armed"):
                 envs.append((d, clock, (await self._get_trigger_state(d)).get("triggers", [])))
         pending = [(_utc(t["next_mark"]), d, t) for d, _, rows in envs for t in rows
-                   if t.get("type") == "time" and t.get("status") in _SCHEDULED_STATUSES and t.get("next_mark")]
+                   if t.get("type") == "time" and t.get("status") in _SCHEDULED_STATUSES and t.get("next_mark")
+                   and (d.env_id, t["id"], t["next_mark"]) not in timed_out]
         if not envs:
             return {"stopped": "no_armed_env_clock", "virtual_time": None}
         end = _utc(advance["end_time"]) if advance["end_time"] else None
@@ -977,6 +980,8 @@ class PromptAgentTaskStep(TaskStep):
         due = [(d, t) for m, d, t in pending if m == mark]
         moved = await self._move_env_clocks(envs, mark, check_marks=True)
         statuses = await self._wait_fired(context, due, advance["fire_timeout_seconds"])
+        # A mark whose trigger didn't settle is not chosen again, so an unfinished fire can't hold time still.
+        timed_out.update((d.env_id, t["id"], t["next_mark"]) for d, t in due if statuses[d.env_id][t["id"]] == "timeout")
         trigger_ids = list(dict.fromkeys(t["id"] for _, t in due))
         return {"mark": _iso(mark), "trigger_ids": trigger_ids, "statuses": statuses, "moved": moved}
 
