@@ -167,3 +167,30 @@ async def test_retries_on_malformed_json(monkeypatch):
     assert discrepancies[0]["parse_error"]
     assert len(prompts) == 2
     assert "not valid JSON" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_a2a_concatenated_messages_parse_without_retry(monkeypatch):
+    verifier = _verifier(use_agent_judge=True)
+    invoke = AsyncMock(return_value={
+        "response": '{"results":[]}' + _valid_response(["c1", "c2"]), "trajectory_object_url": None})
+    monkeypatch.setattr(verifier, "_configure_judge_a2a", AsyncMock())
+    monkeypatch.setattr(verifier, "_invoke_judge_a2a", invoke)
+
+    results, retries, discrepancies, _ = await verifier._run_judge_with_output_retries(
+        eval_prompt="Evaluate the agent.",
+        criteria=verifier.criteria,
+        context=TaskStepContext(),
+        model="claude-sonnet-4-6",
+        judge_a2a_url="http://judge.example/a2a",
+        judge_agent_card={},
+        judge_agent=SimpleNamespace(sandbox_id="sb-test", sandbox_type=None),
+        judge_effort=None,
+        judge_max_thinking_tokens=None,
+        use_agent_judge=True,
+    )
+
+    assert [r["id"] for r in results] == ["c1", "c2"]
+    assert retries == 0
+    assert discrepancies == []
+    assert invoke.await_count == 1

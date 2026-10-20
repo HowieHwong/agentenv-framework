@@ -9,7 +9,10 @@ from agent_env.task_step.task_steps.verifiers.judge_utils.judge_output_format im
     JUDGE_OUTPUT_FORMAT_REGISTRY,
     JudgeOutputFormat,
     diagnose_rubric_binary_response,
+    diagnose_rubric_evidence_mistakes_response,
+    diagnose_rubric_evidence_response,
     diagnose_rubric_partial_response,
+    diagnose_trajectory_mistakes_response,
     format_partial_judge_correction_prompt,
     format_judge_correction_prompt,
     get_judge_output_format_spec,
@@ -197,6 +200,105 @@ class TestDiagnoseRubricBinaryResponse:
             "duplicate_ids": [],
             "unknown_ids": [],
         }
+
+
+def _results_json(ids: list[str], **extra) -> str:
+    return json.dumps({**extra, "results": [{"id": cid, "score": 1.0, "justification": "ok"} for cid in ids]})
+
+
+class TestConcatenatedJudgeResponses:
+    """An agent judge's reply joins every message of its turn, so it can hold several JSON objects."""
+
+    def test_empty_interim_then_full_object_uses_full(self):
+        response = '{"results":[]}' + _results_json(["c1", "c2"])
+        results, discrepancy = diagnose_rubric_binary_response(response, _criteria(["c1", "c2"]))
+        assert discrepancy is None
+        assert [r["id"] for r in results] == ["c1", "c2"]
+
+    def test_partial_then_full_object_uses_full(self):
+        response = _results_json(["c1"]) + "\n\n" + _results_json(["c1", "c2", "c3"])
+        results, discrepancy = diagnose_rubric_binary_response(response, _criteria(["c1", "c2", "c3"]))
+        assert discrepancy is None
+        assert [r["id"] for r in results] == ["c1", "c2", "c3"]
+
+    def test_latest_valid_object_wins(self):
+        first = json.dumps({"results": [{"id": "c1", "score": 0.0, "justification": "draft"}]})
+        last = json.dumps({"results": [{"id": "c1", "score": 1.0, "justification": "final"}]})
+        results, discrepancy = diagnose_rubric_binary_response(first + last, _criteria(["c1"]))
+        assert discrepancy is None
+        assert results[0]["justification"] == "final"
+
+    def test_full_object_then_empty_uses_earlier_full(self):
+        response = _results_json(["c1", "c2"]) + ' {"results":[]}'
+        results, discrepancy = diagnose_rubric_binary_response(response, _criteria(["c1", "c2"]))
+        assert discrepancy is None
+        assert [r["id"] for r in results] == ["c1", "c2"]
+
+    def test_no_valid_object_returns_last_ones_discrepancy(self):
+        response = '{"results":[]}' + _results_json(["c1"])
+        results, discrepancy = diagnose_rubric_binary_response(response, _criteria(["c1", "c2"]))
+        _, alone = diagnose_rubric_binary_response(_results_json(["c1"]), _criteria(["c1", "c2"]))
+        assert results is None
+        assert discrepancy == alone
+        assert discrepancy.missing_ids == ["c2"]
+
+    def test_no_valid_object_parse_response_raises_like_a_bad_single_object(self):
+        spec = get_judge_output_format_spec(JudgeOutputFormat.RUBRIC_BINARY)
+        with pytest.raises(ValueError, match=r"expected 2 criteria"):
+            spec.parse_response('{"results":[]}' + _results_json(["c1"]), _criteria(["c1", "c2"]))
+
+    def test_single_valid_object_unchanged(self):
+        response = _results_json(["c1", "c2"])
+        assert diagnose_rubric_binary_response(response, _criteria(["c1", "c2"])) == \
+            diagnose_rubric_binary_response(f"  {response}\n", _criteria(["c1", "c2"]))
+        results, discrepancy = diagnose_rubric_binary_response(response, _criteria(["c1", "c2"]))
+        assert discrepancy is None and len(results) == 2
+
+    def test_trailing_text_stays_a_parse_error(self):
+        results, discrepancy = diagnose_rubric_binary_response(
+            _results_json(["c1"]) + " done.", _criteria(["c1"]))
+        assert results is None
+        assert "Extra data" in discrepancy.parse_error
+
+    def test_trailing_text_after_several_objects_stays_a_parse_error(self):
+        results, discrepancy = diagnose_rubric_binary_response(
+            '{"results":[]}' + _results_json(["c1"]) + " done.", _criteria(["c1"]))
+        assert results is None
+        assert "Extra data" in discrepancy.parse_error
+
+    def test_partial_format(self):
+        response = '{"results":[]}' + json.dumps({"results": [{"id": "c1", "score": 0.5, "justification": "j"}]})
+        results, discrepancy = diagnose_rubric_partial_response(response, _criteria(["c1"]))
+        assert discrepancy is None
+        assert results[0]["score"] == 0.5
+
+    def test_rubric_evidence_format(self):
+        full = json.dumps({"reasoning": "final", "checks": [], "results": [
+            {"id": "c1", "frame": "[c1] a", "evidence_status": "visible", "justification": "j", "score": 1.0}]})
+        rows, discrepancy = diagnose_rubric_evidence_response(
+            '{"reasoning":"interim","checks":[],"results":[]}' + full, _criteria(["c1"]))
+        assert discrepancy is None
+        assert rows.reasoning == "final" and rows[0]["evidence_status"] == "visible"
+
+    def test_rubric_evidence_with_mistakes_skips_object_missing_mistake_fields(self):
+        mistakes = {"findings": [], "botched": False, "summary": "s"}
+        complete = _results_json(["c1"], reasoning="complete", checks=[], **mistakes)
+        rows, discrepancy = diagnose_rubric_evidence_mistakes_response(
+            complete + _results_json(["c1"], reasoning="no mistakes", checks=[]), _criteria(["c1"]))
+        assert discrepancy is None
+        assert rows.reasoning == "complete" and rows.mistakes["summary"] == "s"
+
+    def test_trajectory_mistakes_format_with_fences(self):
+        final = {"findings": [], "coverage": [], "botched": True, "botched_reason": "r", "summary": "final"}
+        response = "```json\n" + '["interim"]' + json.dumps(final) + "\n```"
+        rows, discrepancy = diagnose_trajectory_mistakes_response(response, [])
+        assert discrepancy is None
+        assert next(r for r in rows if r["id"] == "summary")["justification"] == "final"
+
+    def test_trajectory_mistakes_no_dict_returns_last_ones_discrepancy(self):
+        rows, discrepancy = diagnose_trajectory_mistakes_response("[1] [2]", [])
+        assert rows is None
+        assert discrepancy.parse_error == "unexpected response shape: list"
 
 
 class TestFormatJudgeCorrectionPrompt:

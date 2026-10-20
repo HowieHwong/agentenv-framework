@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -704,47 +705,94 @@ def _build_validated_results_partial(results: list, criteria: list[dict]) -> lis
     return validated
 
 
-def _parse_judge_results(
-    response_text: str,
-    criteria: list[dict],
-) -> tuple[object, list | None, JudgeResponseDiscrepancy | None]:
-    """Shared parse/validate path: JSON -> results array -> id check. Returns ``(parsed, results,
-    discrepancy)`` — the parsed JSON so a format can read its other keys, and the id-checked results array
-    or the discrepancy."""
-    text = response_text.strip()
+_JSON_DECODER = json.JSONDecoder()
+_WHITESPACE = re.compile(r"\s*")
 
+JudgeDiagnosis = tuple[list[dict] | None, JudgeResponseDiscrepancy | None]
+
+
+def _concatenated_json_values(text: str) -> list[object] | None:
+    """Every top-level JSON value in ``text`` when it is two or more of them separated only by whitespace, else
+    None, so a value followed by anything that is not JSON stays a parse error."""
+    values: list[object] = []
+    index = 0
+    while index < len(text):
+        try:
+            value, index = _JSON_DECODER.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return None
+        values.append(value)
+        index = _WHITESPACE.match(text, index).end()
+    return values if len(values) > 1 else None
+
+
+def _diagnose_json_response(
+    text: str,
+    criteria: list[dict],
+    diagnose_value: Callable[[object, list[dict]], JudgeDiagnosis],
+) -> JudgeDiagnosis:
+    """Parse ``text`` as JSON and validate it with ``diagnose_value``. An agent judge whose reply joins every
+    message of its turn sends several concatenated JSON values: then the latest one that validates is used,
+    and when none does, the last one's discrepancy is returned."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse judge response as JSON: {e}")
-        logger.error(f"Raw response: {response_text[:500]}")
-        return None, None, _parse_failure_discrepancy(criteria, str(e))
+        values = _concatenated_json_values(text)
+        if values is None:
+            logger.error(f"Failed to parse judge response as JSON: {e}")
+            logger.error(f"Raw response: {text[:500]}")
+            return None, _parse_failure_discrepancy(criteria, str(e))
+    else:
+        return diagnose_value(parsed, criteria)
 
+    last_discrepancy = None
+    for index in reversed(range(len(values))):
+        rows, discrepancy = diagnose_value(values[index], criteria)
+        if discrepancy is None:
+            logger.warning("Judge response holds %d concatenated JSON values; using value %d",
+                           len(values), index)
+            return rows, None
+        last_discrepancy = last_discrepancy or discrepancy
+    logger.warning("Judge response holds %d concatenated JSON values; none is valid", len(values))
+    return None, last_discrepancy
+
+
+def _checked_results(parsed: object, criteria: list[dict]) -> tuple[list | None, JudgeResponseDiscrepancy | None]:
+    """The results array of a parsed rubric response once its ids match ``criteria``, or the discrepancy."""
     results = _extract_rubric_binary_results(parsed)
     if results is None:
         logger.error(f"Unexpected judge response shape: {type(parsed)}")
-        return parsed, None, _parse_failure_discrepancy(
+        return None, _parse_failure_discrepancy(
             criteria, f"unexpected response shape: {type(parsed).__name__}"
         )
 
     discrepancy = _analyze_result_ids(results, criteria)
     if discrepancy is not None:
-        return parsed, None, discrepancy
+        return None, discrepancy
 
-    return parsed, results, None
+    return results, None
+
+
+def _diagnose_rubric_value(
+    parsed: object,
+    criteria: list[dict],
+    build_results: Callable[[list, list[dict]], list[dict]],
+) -> JudgeDiagnosis:
+    """`_checked_results` -> rows. `build_results` decides how each row's `score`/`result` are derived, so
+    binary and partial formats reuse the same id-integrity handling."""
+    results, discrepancy = _checked_results(parsed, criteria)
+    if results is None:
+        return None, discrepancy
+    return build_results(results, criteria), None
 
 
 def _diagnose_response(
     response_text: str,
     criteria: list[dict],
     build_results: Callable[[list, list[dict]], list[dict]],
-) -> tuple[list[dict] | None, JudgeResponseDiscrepancy | None]:
-    """`_parse_judge_results` -> rows. `build_results` decides how each row's `score`/`result` are
-    derived, so binary and partial formats reuse the same JSON/id-integrity handling."""
-    _, results, discrepancy = _parse_judge_results(response_text, criteria)
-    if results is None:
-        return None, discrepancy
-    return build_results(results, criteria), None
+) -> JudgeDiagnosis:
+    return _diagnose_json_response(
+        response_text.strip(), criteria, partial(_diagnose_rubric_value, build_results=build_results))
 
 
 def diagnose_rubric_binary_response(
@@ -810,7 +858,12 @@ def diagnose_rubric_evidence_response(
     discrepancy. ``with_mistakes`` (rubric_evidence_with_mistakes) also requires ``findings`` / ``botched`` /
     ``summary`` — a missing one is a discrepancy, retried like invalid JSON — and lands them on
     ``ResultRows.mistakes``; otherwise those fields are ignored."""
-    parsed, results, discrepancy = _parse_judge_results(response_text, criteria)
+    return _diagnose_json_response(
+        response_text.strip(), criteria, partial(_diagnose_evidence_value, with_mistakes=with_mistakes))
+
+
+def _diagnose_evidence_value(parsed: object, criteria: list[dict], *, with_mistakes: bool) -> JudgeDiagnosis:
+    results, discrepancy = _checked_results(parsed, criteria)
     if results is None:
         return None, discrepancy
     top = parsed if isinstance(parsed, dict) else {}
@@ -1147,11 +1200,16 @@ def diagnose_trajectory_mistakes_response(
 
     ``severity_weights`` is the caller's severity→penalty table (see
     ``_trajectory_mistakes_rows``); None uses the built-in fallback."""
-    try:
-        parsed = json.loads(_strip_json_fences(response_text))
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse trajectory-mistakes judge response as JSON: {e}")
-        return None, _parse_failure_discrepancy(criteria, str(e))
+    return _diagnose_json_response(
+        _strip_json_fences(response_text), criteria,
+        partial(_diagnose_trajectory_mistakes_value, severity_weights=severity_weights))
+
+
+def _diagnose_trajectory_mistakes_value(
+    parsed: object,
+    criteria: list[dict],
+    severity_weights: dict[str, float] | None,
+) -> JudgeDiagnosis:
     if not isinstance(parsed, dict):
         return None, _parse_failure_discrepancy(criteria, f"unexpected response shape: {type(parsed).__name__}")
     return _trajectory_mistakes_rows(parsed, severity_weights), None
