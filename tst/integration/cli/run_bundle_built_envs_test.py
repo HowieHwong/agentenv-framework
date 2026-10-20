@@ -9,7 +9,8 @@ of bundle and store servers, and a store universe shared across servers seeds th
 echo-mcp example agent-env ships runs by name, and a rerun writes nothing, and a task held under bare ids, as a registry
 holds it, imports as a bundle that runs through the gateway; an output a bundle's task wrote is written under the folder
 that imports the task. A script run on an env's host reaches the env's gateway and MCP endpoint at the addresses its
-input gives. Needs a Docker daemon and the local registry."""
+input gives. A server that crashes on start fails its deploy with an error that names it and ends with what it printed.
+Needs a Docker daemon and the local registry."""
 
 import hashlib
 import json
@@ -658,3 +659,18 @@ def test_an_output_a_bundles_task_wrote_is_written_under_the_folder_that_imports
         assert written.type == "cli"
         with pytest.raises(NotFoundError):
             Artifact.get(f"{old}/echo-cli")
+
+
+def test_a_server_that_crashes_on_start_fails_its_deploy_naming_it_and_ending_with_what_it_printed(state):
+    root = state / "crash-bundle"
+    _items(root / "envs/items", "v1")
+    server = root / "envs/items/server.py"
+    server.write_text("import psycopg\n" + server.read_text())
+    _check(root, "items", items=["items"])
+
+    run = _run(root)
+
+    assert run.exit_code == 1, run.output
+    assert "The env's services didn't start:\nitems exited (1):" in run.output, run.output
+    assert "    ModuleNotFoundError: No module named 'psycopg'" in run.output, run.output
+    assert "Error dependency" not in run.output, run.output
