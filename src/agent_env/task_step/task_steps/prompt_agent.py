@@ -975,7 +975,8 @@ class PromptAgentTaskStep(TaskStep):
         due = [(d, t) for m, d, t in pending if m == mark]
         moved = await self._move_env_clocks(envs, mark, check_marks=True)
         statuses = await self._wait_fired(context, due, advance["fire_timeout_seconds"])
-        return {"mark": _iso(mark), "trigger_ids": [t["id"] for _, t in due], "statuses": statuses, "moved": moved}
+        trigger_ids = list(dict.fromkeys(t["id"] for _, t in due))
+        return {"mark": _iso(mark), "trigger_ids": trigger_ids, "statuses": statuses, "moved": moved}
 
     async def _move_env_clocks(self, envs: list, target: datetime, *, check_marks: bool) -> dict:
         """Bring each env clock behind ``target`` up to it, by advance where offered, else a re-arm only fixed marks survive."""
@@ -998,36 +999,37 @@ class PromptAgentTaskStep(TaskStep):
         return moved
 
     async def _wait_fired(self, context: TaskStepContext, due: list, timeout_seconds: float) -> dict:
-        """Each due trigger's outcome once it has fired, failed or been cancelled; "timeout" for one still unsettled."""
-        before = {t["id"]: (t.get("fire_count") or 0, t.get("failure_count") or 0) for _, t in due}
+        """``{env_id: {trigger_id: outcome}}`` once each due trigger has fired, failed or been cancelled; "timeout" if not."""
+        before = {(d.env_id, t["id"]): (t.get("fire_count") or 0, t.get("failure_count") or 0) for d, t in due}
         by_env: dict[str, tuple[Any, list[str]]] = {}
         for d, t in due:
             by_env.setdefault(d.env_id, (d, []))[1].append(t["id"])
-        outcome: dict[str, str] = {}
+        outcome: dict[tuple[str, str], str] = {}
         deadline = time.monotonic() + timeout_seconds
         while True:
-            for d, ids in by_env.values():
+            for env_id, (d, ids) in by_env.items():
                 rows = {t["id"]: t for t in (await self._get_trigger_state(d)).get("triggers", [])}
-                for tid in (i for i in ids if i not in outcome):
+                for tid in (i for i in ids if (env_id, i) not in outcome):
                     row = rows.get(tid)
-                    fires, failures = before[tid]
+                    fires, failures = before[(env_id, tid)]
                     if row is None:
-                        outcome[tid] = "removed"
+                        outcome[(env_id, tid)] = "removed"
                     elif row.get("status") in TRIGGER_IN_FLIGHT_STATUSES:
                         continue
                     elif (row.get("failure_count") or 0) > failures:
-                        outcome[tid] = "failed"
+                        outcome[(env_id, tid)] = "failed"
                     elif (row.get("fire_count") or 0) > fires or row.get("status") in _SETTLED_STATUSES:
-                        outcome[tid] = "fired" if row.get("status") == "armed" else row["status"]
-            if len(outcome) == len(due) or time.monotonic() >= deadline:
+                        outcome[(env_id, tid)] = "fired" if row.get("status") == "armed" else row["status"]
+            if len(outcome) == len(before) or time.monotonic() >= deadline:
                 break
             context.heartbeat()
             await asyncio.sleep(_FIRE_POLL_SECONDS)
-        for _, t in due:
-            if t["id"] not in outcome:
-                logger.warning(f"{self.id}: time trigger '{t['id']}' had not settled {timeout_seconds}s after its mark")
-                outcome[t["id"]] = "timeout"
-        return outcome
+        statuses: dict[str, dict[str, str]] = {}
+        for env_id, tid in before:
+            if (env_id, tid) not in outcome:
+                logger.warning(f"{self.id}: time trigger '{tid}' on env '{env_id}' had not settled {timeout_seconds}s after its mark")
+            statuses.setdefault(env_id, {})[tid] = outcome.get((env_id, tid), "timeout")
+        return statuses
 
     _CAPTURE_BUDGET_SECONDS: ClassVar[float] = 90
 

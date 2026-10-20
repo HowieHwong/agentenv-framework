@@ -3,6 +3,7 @@ the run waits for those triggers, and the agent is woken; with the option unset 
 from __future__ import annotations
 
 import copy
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -167,7 +168,7 @@ async def test_two_events_days_apart_each_wake_the_agent_once_then_the_run_ends(
                               DEFAULT_WAKE_MESSAGE.format(virtual_time=DAY2)]
     assert env.moves() == [("advance", {"virtual_time": DAY1}), ("advance", {"virtual_time": DAY2})]
     advances = ctx.metadata["env_event_advances"]["watch"]
-    assert advances[0] == {"turn": 1, "mark": DAY1, "trigger_ids": ["school-email"], "statuses": {"school-email": "fired"},
+    assert advances[0] == {"turn": 1, "mark": DAY1, "trigger_ids": ["school-email"], "statuses": {"env-1": {"school-email": "fired"}},
                            "moved": {"env-1": "advance"}}
     assert advances[1]["trigger_ids"] == ["calendar-clash"]
     assert advances[2] == {"turn": 3, "stopped": "no_pending_time_triggers", "virtual_time": None}
@@ -221,6 +222,21 @@ async def test_triggers_due_at_one_mark_share_one_wake(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_one_trigger_id_on_two_envs_is_awaited_on_each_without_waiting_out_the_timeout(monkeypatch):
+    seen = _wire(monkeypatch)
+    envs = (_Env({"news": DAY1}, env_id="env-1"), _Env({"news": DAY1}, env_id="env-2"))
+    started = time.monotonic()
+
+    ctx = await _step({"mode": "next_env_event", "fire_timeout_seconds": 5}, turns=2).execute(_context(*envs))
+
+    assert time.monotonic() - started < 2
+    advance = ctx.metadata["env_event_advances"]["watch"][0]
+    assert advance["statuses"] == {"env-1": {"news": "fired"}, "env-2": {"news": "fired"}}
+    assert (advance["trigger_ids"], advance["moved"]) == (["news"], {"env-1": "advance", "env-2": "advance"})
+    assert seen["solver"][1] == DEFAULT_WAKE_MESSAGE.format(virtual_time=DAY1)
+
+
+@pytest.mark.asyncio
 async def test_a_gateway_without_advance_is_rearmed_at_its_own_rate(monkeypatch):
     _wire(monkeypatch)
     env = _Env({"school-email": DAY1}, rate=60.0, advance=False)
@@ -247,8 +263,8 @@ async def test_a_failed_or_stuck_trigger_is_reported_and_the_agent_still_woken(m
     stuck = await _step({"mode": "next_env_event", "fire_timeout_seconds": 0.01}, turns=2).execute(
         _context(_Env({"e": DAY1}, outcome="stuck")))
 
-    assert failed.metadata["env_event_advances"]["watch"][0]["statuses"] == {"e": "failed"}
-    assert stuck.metadata["env_event_advances"]["watch"][0]["statuses"] == {"e": "timeout"}
+    assert failed.metadata["env_event_advances"]["watch"][0]["statuses"] == {"env-1": {"e": "failed"}}
+    assert stuck.metadata["env_event_advances"]["watch"][0]["statuses"] == {"env-1": {"e": "timeout"}}
     assert len(seen["solver"]) == 4
 
 
