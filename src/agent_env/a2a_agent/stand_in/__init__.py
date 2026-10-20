@@ -14,7 +14,7 @@ from pathlib import Path
 import agentenv_protocol
 from packaging.requirements import Requirement
 
-from agent_env.a2a_agent.a2a_agent import SHARE_STORE_CREDENTIALS, A2AAgent
+from agent_env.a2a_agent.a2a_agent import TAKES_CREDENTIALS, A2AAgent
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.store.base import NotFoundError
 
@@ -41,11 +41,7 @@ def stand_in_agent() -> A2AAgent:
             _IMAGE_ID, description="The stand-in agent: a driver outside its sandbox answers its turns.",
             context_path=str(context), dockerfile_path=dockerfile, platform=None,
         )
-        return A2AAgent.put(
-            id=STAND_IN_AGENT_ID, docker_image_artifact=image,
-            default_env_vars={"LITELLM_API_KEY": "unused", "LITELLM_BASE_URL": "http://unused.invalid"},
-            metadata={SHARE_STORE_CREDENTIALS: False},
-        )
+        return A2AAgent.put(id=STAND_IN_AGENT_ID, docker_image_artifact=image, metadata={TAKES_CREDENTIALS: False})
 
 
 def _stage(context: Path) -> Path:

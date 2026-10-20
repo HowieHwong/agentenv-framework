@@ -110,8 +110,9 @@ class _ToolSessions:
     """Stands in for ``ToolSession``: the session on each URL serves the tools ``offered`` names for it, and every
     session opened, call made and session closed is recorded."""
 
-    def __init__(self, offered):
+    def __init__(self, offered, raises=None):
         self.offered = offered
+        self.raises = raises or {}
         self.opened = []
         self.calls = []
         self.closed = []
@@ -129,6 +130,8 @@ class _ToolSessions:
 
             async def call_tool(self, name, arguments=None):
                 sessions.calls.append((mcp_url, name, arguments))
+                if name in sessions.raises:
+                    raise sessions.raises[name]
                 return ToolResult(content=[{"type": "text", "text": f"{name} on {mcp_url}"}])
 
             async def close(self):
@@ -216,8 +219,8 @@ PANTRY = {"id": "pantry", "type": "episode_test_env", "env_id": "pantry"}
 STOCKED = {**ALICE, "env_ids": ["items", "pantry"]}
 
 
-def _tool_sessions(monkeypatch, offered):
-    sessions = _ToolSessions(offered)
+def _tool_sessions(monkeypatch, offered, raises=None):
+    sessions = _ToolSessions(offered, raises)
     monkeypatch.setattr(episode_run, "ToolSession", sessions)
     monkeypatch.setattr(episode_run, "sandbox_request_headers_for_url", lambda url: {"X-Sandbox": url})
     return sessions
@@ -572,9 +575,10 @@ async def test_cancelling_the_caller_of_abandon_still_abandons_the_run(teardowns
     abandoning.cancel()
     with pytest.raises(asyncio.CancelledError):
         await abandoning
-    await _until(lambda: Task.get_instance(episode.id).status == "cancelled")
+    with pytest.raises(EpisodeError, match="episode abandoned: stop"):
+        await episode.result()
 
-    assert (Task.get_instance(episode.id).status,Task.get_instance(episode.id).error) == ("cancelled", "stop")
+    assert (Task.get_instance(episode.id).status, Task.get_instance(episode.id).error) == ("cancelled", "stop")
     assert teardowns.finished == [episode.id]
 
 
@@ -658,6 +662,40 @@ async def test_a_turns_calls_and_its_reply_are_handed_back_as_its_trajectory(mon
     assert json.loads(spans[2]["attributes"]["gen_ai.completion"]) == {
         "content": [{"type": "text", "text": "Added a crate."}]}
     assert all(span["start_time"] <= span["end_time"] for span in spans)
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_raises_is_handed_back_in_the_trajectory_too(monkeypatch):
+    _tool_sessions(monkeypatch, {ITEMS_MCP: ["items_add_item"]},
+                   raises={"items_add_item": TimeoutError("the env didn't answer")})
+    stand_in = _SandboxedStandIn()
+    turn = _sandboxed_turn(stand_in)
+
+    async with turn.tools() as tools:
+        with pytest.raises(TimeoutError, match="the env didn't answer"):
+            await tools.call("items_add_item", {"name": "crate"})
+    await turn.end("Gave up.")
+
+    [(_, reply)] = stand_in.replies
+    assert reply["tool_call_count"] == 1
+    assert json.loads(reply["trajectory"][0]["attributes"]["gen_ai.completion"]) == {
+        "error": "TimeoutError: the env didn't answer"}
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_continuing_a_conversation_gets_its_own_turn(teardowns):
+    first = {**TURN, "context_id": "chat"}
+    again = {**TURN, "id": "again", "prompt_id": "again", "prompt": "And another.", "depends_on": ["turn"],
+             "context_id": "chat"}
+    episode = await _spec(ITEMS, ALICE, first, again, REPLIES).start()
+
+    turn = await episode.next_turn()
+    assert (turn.step_id, turn.prompt) == ("turn", "Add a crate.")
+    await turn.end("Added.")
+    turn = await episode.next_turn()
+    assert (turn.step_id, turn.prompt) == ("again", "And another.")
+    await turn.end("Added another.")
+    assert await episode.result() == {"replies": 1.0}
 
 
 @pytest.mark.asyncio

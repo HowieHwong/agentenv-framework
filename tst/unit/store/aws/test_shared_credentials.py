@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from agentenv_protocol import client as protocol_v1
 
-from agent_env.a2a_agent.a2a_agent import SHARE_STORE_CREDENTIALS, A2AAgent
+from agent_env.a2a_agent.a2a_agent import TAKES_CREDENTIALS, A2AAgent
 from agent_env.config import set_object_store
 from agent_env.store import routing
 from agent_env.store.object_store import s3_object_store
@@ -85,4 +85,4 @@ def test_a_caller_supplied_key_suppresses_the_whole_shared_set(host_credentials)
 
 def test_an_agent_that_opts_out_gets_none_of_the_shared_set(host_credentials):
     set_object_store(S3ObjectStore(object(), "bucket", region="us-west-2", share_credentials=True))
-    assert not any(key.startswith("AWS_") for key in _merged_env(metadata={SHARE_STORE_CREDENTIALS: False}))
+    assert not any(key.startswith("AWS_") for key in _merged_env(metadata={TAKES_CREDENTIALS: False}))

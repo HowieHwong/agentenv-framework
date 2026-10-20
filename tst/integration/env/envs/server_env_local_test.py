@@ -307,8 +307,8 @@ def _items_artifact(uid: str) -> EnvironmentArtifact:
 @pytest.mark.asyncio
 async def test_an_agent_that_works_in_its_sandbox_is_played_through_a_stand_in_deployed_there(local_stack, tmp_path):
     """A task that loads files into its agent and checks what the agent left there: the agent is never deployed,
-    a stand-in is, in its place, and the loop's ``bash`` runs in it, as its user and in its folder, with no model key
-    of its own; the check scores what the commands left, and nothing is left running."""
+    a stand-in is, in its place, and the loop's ``bash`` runs in it, as its user and in its folder, with no model
+    credentials; the check scores what the commands left, and nothing is left running."""
     uid = uuid.uuid4().hex[:8]
     greeting = FileArtifact.put_bytes(id=f"greeting-{uid}", description="stand-in e2e", filename="greeting.txt",
                                       content=b"hello", content_type="text/plain")
@@ -329,7 +329,7 @@ async def test_an_agent_that_works_in_its_sandbox_is_played_through_a_stand_in_d
         assert [tool.name for tool in tools.list()] == ["bash"]
         assert (await tools.call("bash", {"command": "pwd; whoami; cat inputs/greeting.txt"})).text == (
             "/app\nagent\nhello")
-        assert (await tools.call("bash", {"command": "printenv LITELLM_API_KEY"})).text == "unused\n"
+        assert (await tools.call("bash", {"command": "env | grep -c ^LITELLM_ || true"})).text == "0\n"
         await tools.call("bash", {"command": "mkdir -p outputs && cp inputs/greeting.txt outputs/answer.txt"})
     await turn.end("Copied.")
 

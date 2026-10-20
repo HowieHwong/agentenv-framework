@@ -63,7 +63,10 @@ _DIND_IMAGE = (
 _DIND_CONTAINER = "agent-dind"
 _DIND_NETWORK = "agent-docker-net"
 _DIND_PORT = 2375
-SHARE_STORE_CREDENTIALS = "share_store_credentials"
+# Metadata an agent whose commands its player runs sets False: it is given no model endpoint, key or headers, whatever
+# a deploy passes, and none of the object store's shared credentials.
+TAKES_CREDENTIALS = "takes_credentials"
+MODEL_CREDENTIALS_ENV = ("LITELLM_API_KEY", "LITELLM_BASE_URL", MODEL_HEADERS_ENV)
 
 
 def unwritten_local_agent(agent_id: str, field: str) -> str:
@@ -455,16 +458,7 @@ class A2AAgent:
         provider = None if sandbox is not None else (
             build_sandbox_provider(sandbox_type) if sandbox_type else get_agent_sandbox_provider()
         )
-        resolved_env = dict(env_vars) if env_vars else {}
-        if "LITELLM_API_KEY" not in resolved_env and "LITELLM_API_KEY" not in self.default_env_vars:
-            resolved_env["LITELLM_API_KEY"] = config.get_litellm_api_key()
-        if "LITELLM_BASE_URL" not in resolved_env and "LITELLM_BASE_URL" not in self.default_env_vars:
-            resolved_env["LITELLM_BASE_URL"] = config.get_litellm_base_url()
-        if MODEL_HEADERS_ENV not in resolved_env and MODEL_HEADERS_ENV not in self.default_env_vars:
-            headers = config.get_model_headers(
-                resolved_env.get("LITELLM_BASE_URL", self.default_env_vars.get("LITELLM_BASE_URL")))
-            if headers:
-                resolved_env[MODEL_HEADERS_ENV] = json.dumps(headers)
+        resolved_env = self._with_model_credentials(env_vars or {}, config)
         if "LITELLM_BASE_URL" in resolved_env:
             resolved_env["LITELLM_BASE_URL"] = (provider or sandbox).url_from_sandbox(resolved_env["LITELLM_BASE_URL"])
 
@@ -545,12 +539,29 @@ class A2AAgent:
             return f"{how}: {problem}"
         return None
 
+    def _with_model_credentials(self, env_vars: dict[str, str], config) -> dict[str, str]:
+        """``env_vars`` with the model endpoint, key and headers each taken from config when neither they nor
+        ``default_env_vars`` set it; for an agent that takes no credentials, with none of them, whatever set them."""
+        if not self.metadata.get(TAKES_CREDENTIALS, True):
+            return {name: value for name, value in env_vars.items() if name not in MODEL_CREDENTIALS_ENV}
+        resolved_env = dict(env_vars)
+        if "LITELLM_API_KEY" not in resolved_env and "LITELLM_API_KEY" not in self.default_env_vars:
+            resolved_env["LITELLM_API_KEY"] = config.get_litellm_api_key()
+        if "LITELLM_BASE_URL" not in resolved_env and "LITELLM_BASE_URL" not in self.default_env_vars:
+            resolved_env["LITELLM_BASE_URL"] = config.get_litellm_base_url()
+        if MODEL_HEADERS_ENV not in resolved_env and MODEL_HEADERS_ENV not in self.default_env_vars:
+            headers = config.get_model_headers(
+                resolved_env.get("LITELLM_BASE_URL", self.default_env_vars.get("LITELLM_BASE_URL")))
+            if headers:
+                resolved_env[MODEL_HEADERS_ENV] = json.dumps(headers)
+        return resolved_env
+
     def _build_merged_env(self, resolved_env: dict[str, str], a2a_port: int) -> dict[str, str]:
         merged_env = dict(self.default_env_vars)
         merged_env.update(resolved_env)
         merged_env["A2A_PORT"] = str(a2a_port)
         shared = get_config().get_object_store().shared_credentials_env()
-        if self.metadata.get(SHARE_STORE_CREDENTIALS, True) and shared.keys().isdisjoint(merged_env):
+        if self.metadata.get(TAKES_CREDENTIALS, True) and shared.keys().isdisjoint(merged_env):
             merged_env.update(shared)
 
         merged_env.update(all_sandbox_container_env())

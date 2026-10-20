@@ -193,20 +193,21 @@ class StandInAgent(AgentEnvAgent):
 
 async def _run(command: str) -> str:
     """``command``'s stdout then its stderr, as verifiers' bash tool returns them. It runs in a process group of its
-    own, stopped with whatever it started if it outlives ``COMMAND_TIMEOUT_SECONDS``."""
+    own, stopped with whatever it started if its output isn't done within ``COMMAND_TIMEOUT_SECONDS``, or if the call
+    is cancelled, even when ``bash`` has exited and a child it left holds the output open."""
     process = await asyncio.create_subprocess_exec(
         "bash", "-c", command, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), COMMAND_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        return f"error: the command timed out after {COMMAND_TIMEOUT_SECONDS}s"
-    finally:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            await process.wait()
+    except BaseException as e:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        if isinstance(e, asyncio.TimeoutError):
+            return f"error: the command timed out after {COMMAND_TIMEOUT_SECONDS}s"
+        raise
     return (stdout + stderr).decode(errors="replace")
 
 

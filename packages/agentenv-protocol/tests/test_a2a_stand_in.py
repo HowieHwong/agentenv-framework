@@ -161,6 +161,16 @@ def test_a_command_that_outlives_its_timeout_is_stopped_with_what_it_started(cli
         os.kill(int((tmp_path / "child").read_text()), 0)
 
 
+def test_a_child_left_holding_the_output_is_stopped_when_the_command_times_out(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(stand_in, "COMMAND_TIMEOUT_SECONDS", 0.5)
+
+    output = _ran(client, "sleep 60 & echo $! > child")
+
+    assert output == "error: the command timed out after 0.5s"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "child").read_text()), 0)
+
+
 def test_output_names_a_command_it_started(client):
     assert _driver(client, "output", exec_id="nope").status_code == 404
 

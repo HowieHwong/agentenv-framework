@@ -144,15 +144,21 @@ class TurnTools:
         if name not in self._offered_by:
             raise EpisodeError(
                 f"no env of turn {self._turn.step_id!r} offers tool {name!r}; they offer {sorted(self._offered_by)}")
-        started = _now()
-        env_id = self._offered_by[name]
-        if env_id is None:
-            result = await self._bash(arguments or {})
-        else:
-            result = await self._sessions[env_id].call_tool(name, arguments)
-        self._turn._spans.append(_span(name, "execute_tool", started, prompt={"input": arguments or {}},
-                                       completion={"output": result.content}))
+        started, env_id = _now(), self._offered_by[name]
+        try:
+            if env_id is None:
+                result = await self._bash(arguments or {})
+            else:
+                result = await self._sessions[env_id].call_tool(name, arguments)
+        except Exception as e:
+            self._record(name, arguments, started, {"error": f"{type(e).__name__}: {e}"})
+            raise
+        self._record(name, arguments, started, {"output": result.content})
         return result
+
+    def _record(self, name: str, arguments: dict[str, Any] | None, started: str, completion: dict[str, Any]) -> None:
+        self._turn._spans.append(_span(name, "execute_tool", started, prompt={"input": arguments or {}},
+                                       completion=completion))
 
     async def _bash(self, arguments: dict[str, Any]) -> ToolResult:
         if not isinstance(command := arguments.get("command"), str):
@@ -181,6 +187,7 @@ class Episode:
         self._abandoned: str | None = None
         self._stand_ins: list[StandInClient] = []
         self._drains: list[asyncio.Task[None]] = []
+        self._played: set[str] = set()
         self._in_process: list[InProcessStandIn] = []
 
     async def next_turn(self) -> Turn | None:
@@ -188,6 +195,7 @@ class Episode:
         failed first. End the turns you hold before waiting on one that depends on them."""
         while True:
             changed = self._changed
+            self._close_turns_of_failed_steps()
             while self._waiting and self._abandoned is None:
                 turn = self._waiting.popleft()
                 if turn._open:
@@ -202,6 +210,7 @@ class Episode:
         over: what ``agent-env run`` reports. Making a reward of them is the caller's."""
         while not self._run.done():
             changed = self._changed
+            self._close_turns_of_failed_steps()
             if open_turn := next((turn for turn in self._turns if turn._open), None):
                 raise EpisodeError(
                     f"turn {open_turn.step_id!r} of agent {open_turn.agent!r} isn't ended, so the run can't finish"
@@ -220,6 +229,8 @@ class Episode:
                     await turn._fail(EpisodeError(f"episode abandoned: {reason}"))
             else:
                 self._abandoned = reason
+                for turn in self._turns:
+                    turn._open = False
                 self._run.cancel(msg=reason)
         await asyncio.wait((self._run,))
 
@@ -259,6 +270,13 @@ class Episode:
     async def _wait(self, changed: asyncio.Future[None]) -> None:
         """Until the run ends or what was ``changed`` when the caller last looked changes again."""
         await asyncio.wait((self._run, changed), return_when=asyncio.FIRST_COMPLETED)
+
+    def _close_turns_of_failed_steps(self) -> None:
+        """A step that failed has given up on its turns, which its stand-in drops only a long-poll later."""
+        failed = {failure.get("step_id") for failure in self._context.metadata.get("failed_steps") or []}
+        for turn in self._turns:
+            if turn.step_id in failed:
+                turn._open = False
 
     def _raise_unless_completed(self) -> None:
         if self._abandoned is not None:
@@ -319,13 +337,15 @@ class Episode:
             self._changed = asyncio.get_running_loop().create_future()
 
     def _step_of(self, agent: str, context_id: str) -> str:
-        """The ``prompt_agent`` step whose conversation with ``agent`` a message on ``context_id`` is in."""
+        """The ``prompt_agent`` step a message to ``agent`` on ``context_id`` comes from: of its prompts in that
+        conversation, the first not yet played, since a prompt continuing a conversation runs after the one it
+        continues."""
         conversations = self._context.metadata.get("a2a_conversations", {})
-        for step in self._seeded_steps():
-            if step.type == "prompt_agent" and step.agent_name == agent and (
-                    step.context_id or conversations.get(step.id)) == context_id:
-                return step.id
-        return context_id
+        steps = [step.id for step in self._seeded_steps() if step.type == "prompt_agent" and step.agent_name == agent
+                 and (step.context_id or conversations.get(step.id)) == context_id]
+        step_id = next((step_id for step_id in steps if step_id not in self._played), steps[-1] if steps else context_id)
+        self._played.add(step_id)
+        return step_id
 
     def _seeded_steps(self) -> list:
         return substitute_seed_in_steps(self._task.steps, self._context.metadata.get("seed") or {})
