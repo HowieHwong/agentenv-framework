@@ -985,8 +985,7 @@ class PromptAgentTaskStep(TaskStep):
             if _utc(clock["virtual_time"]) >= target:
                 continue
             if d.supports(EXT_CLOCK_URI, "advance"):
-                await d.invoke(EXT_CLOCK_URI, "advance", {"virtual_time": _iso(target)}, timeout=15)
-                moved[d.env_id] = "advance"
+                moved[d.env_id] = await self._advance_clock(d, target)
                 continue
             unsafe = [t["id"] for t in rows if check_marks and t.get("type") == "time"
                       and t.get("status") == "armed" and not _rearm_safe(t.get("when") or {})]
@@ -997,6 +996,17 @@ class PromptAgentTaskStep(TaskStep):
                                                        clock.get("virtual_seconds_per_real_second", 1.0)}, timeout=15)
             moved[d.env_id] = "set_time"
         return moved
+
+    async def _advance_clock(self, d, target: datetime) -> str:
+        """Advance one env clock to ``target``: "advance", or "passed" when a running clock got there before the call did."""
+        try:
+            await d.invoke(EXT_CLOCK_URI, "advance", {"virtual_time": _iso(target)}, timeout=15)
+            return "advance"
+        except httpx.HTTPStatusError as e:
+            now = await self._get_clock_state(d) if e.response.status_code == 400 else None
+            if now and now.get("armed") and _utc(now["virtual_time"]) >= target:
+                return "passed"
+            raise
 
     async def _wait_fired(self, context: TaskStepContext, due: list, timeout_seconds: float) -> dict:
         """``{env_id: {trigger_id: outcome}}`` once each due trigger has fired, failed or been cancelled; "timeout" if not."""

@@ -34,8 +34,9 @@ class _Env:
     """A deployed env whose clock and time triggers behave as a gateway's: a trigger fires once the clock reaches its mark."""
 
     def __init__(self, marks: dict, *, rate: float = 0.0, advance: bool = True, outcome: str = "fired",
-                 env_id: str = "env-1"):
+                 env_id: str = "env-1", overrun: timedelta | None = None):
         self.env_id, self.rate, self.offers_advance, self.outcome = env_id, rate, advance, outcome
+        self.overrun = overrun
         self.now = _dt(START)
         self.calls: list[tuple[str, dict | None]] = []
         self.rows = {tid: {"id": tid, "type": "time", "status": "armed", "next_mark": at if not at.startswith("P") else
@@ -49,6 +50,10 @@ class _Env:
 
     async def invoke(self, uri, method, params=None, *, timeout=30, environment_name=None):
         self.calls.append((method, params))
+        if uri == EXT_CLOCK_URI and method == "advance" and self.overrun is not None:
+            self.now = _dt(params["virtual_time"]) + self.overrun
+            raise httpx.HTTPStatusError("advance only moves forward", request=httpx.Request("PUT", "http://gw"),
+                                        response=httpx.Response(400, request=httpx.Request("PUT", "http://gw")))
         if uri == EXT_CLOCK_URI and method in ("advance", "set_time"):
             self.now = _dt(params["virtual_time"])
             return {}
@@ -234,6 +239,27 @@ async def test_one_trigger_id_on_two_envs_is_awaited_on_each_without_waiting_out
     assert advance["statuses"] == {"env-1": {"news": "fired"}, "env-2": {"news": "fired"}}
     assert (advance["trigger_ids"], advance["moved"]) == (["news"], {"env-1": "advance", "env-2": "advance"})
     assert seen["solver"][1] == DEFAULT_WAKE_MESSAGE.format(virtual_time=DAY1)
+
+
+@pytest.mark.asyncio
+async def test_a_running_clock_that_passes_the_mark_before_the_advance_lands_is_not_an_error(monkeypatch):
+    seen = _wire(monkeypatch)
+    env = _Env({"school-email": DAY1}, rate=60.0, overrun=timedelta(seconds=2))
+
+    ctx = await _step("next_env_event", turns=2).execute(_context(env))
+
+    advance = ctx.metadata["env_event_advances"]["watch"][0]
+    assert (advance["moved"], advance["statuses"]) == ({"env-1": "passed"}, {"env-1": {"school-email": "fired"}})
+    assert len(seen["solver"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_advance_refused_for_another_reason_still_fails_the_step(monkeypatch):
+    _wire(monkeypatch)
+    env = _Env({"school-email": DAY1}, overrun=timedelta(seconds=-2))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await _step("next_env_event", turns=2).execute(_context(env))
 
 
 @pytest.mark.asyncio
