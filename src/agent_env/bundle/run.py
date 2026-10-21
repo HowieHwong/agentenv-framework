@@ -6,8 +6,9 @@ and the others go on. Each run's sandboxes are torn down as it ends, unless ``ke
 SIGTERM cancels the runs: each one that started is marked cancelled and torn down, and a second one stops the
 teardown. A bundle's evals run only the bundle's own tasks for now, so one naming a store task is refused
 before anything is written, and so is a deploy its sandbox provider can't serve (``preflight``). The infra envs a
-gateway deploy on the local provider needs are built once the writes are done, before any task starts. A dry run
-makes every check the run makes before its first task, and writes, builds and runs nothing.
+gateway deploy on the local provider needs are set up once the writes are done, before any task starts: pulled from
+their published images, or built. A dry run makes every check the run makes before its first task, and writes, builds
+and runs nothing.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from enum import Enum
 from pathlib import Path
 
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
-from agent_env.env.bootstrap import InfraBuild, ensure_default_envs
+from agent_env.env.bootstrap import InfraSetup, ensure_default_envs
 from agent_env.providers import build_sandbox_provider
 from agent_env.store.base import NotFoundError
 from agent_env.store.routing import namespace_routing, run_scope
@@ -152,7 +153,7 @@ class DryRun:
     materialization: Materialization  # each write at the version it would leave, and why
     runs: tuple[BundleEntry, ...]  # the tasks that would run, each once, in the plan's order
     skipped: tuple[BundleEntry, ...]  # the tasks no eval names, which running every eval leaves out
-    infra: tuple[InfraBuild, ...] = ()  # the infra envs the run would build first
+    infra: tuple[InfraSetup, ...] = ()  # the infra envs the run would set up first
     built_here: frozenset[str] = frozenset()  # the images the run would build on this machine, for its deploys here
 
     def path(self, entry: BundleEntry) -> str:
