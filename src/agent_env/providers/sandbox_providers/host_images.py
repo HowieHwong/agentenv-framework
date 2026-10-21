@@ -3,7 +3,8 @@
 An image that is only its build context is built where it runs. Here that is this machine's Docker: built natively,
 under the image's name, labeled with the sources it was built from, and built again only when those change, so a later
 deploy, a parallel one or another run finds it. A VM on this machine starts with no build cache, so it loads a saved
-copy of that build, kept once per sources. Neither is a store version: the image is its build context.
+copy of that build, kept once per sources. Neither is a store version: the image is its build context. An image a
+registry publishes is pulled here by its digest, and built from its build context only when it can't be.
 """
 
 from __future__ import annotations
@@ -100,6 +101,29 @@ def _build(context: Path, dockerfile: str, image_name: str, image_sources: str) 
 async def build_here(image: DockerImageArtifact) -> None:
     """``build`` off the event loop."""
     await asyncio.to_thread(build, image)
+
+
+def pull(image: DockerImageArtifact) -> None:
+    """Have this machine's Docker hold ``image``, one with an ``image_digest``, under its name, unless it already holds
+    one: pulled by its digest, or, when that fails, built from its build context. Raises RuntimeError when it can't be
+    pulled or built."""
+    with holding_locks([f"image-pull:{image.pinned_name}"]):
+        if present(image.image_name):
+            return
+        pulled = subprocess.run(["docker", "pull", image.pinned_name], capture_output=True, text=True, errors="replace")
+        if pulled.returncode == 0:
+            subprocess.run(["docker", "tag", image.pinned_name, image.image_name], capture_output=True, check=True)
+            return
+    why = (pulled.stderr.strip().splitlines() or [f"docker pull exited {pulled.returncode}"])[-1]
+    if not image.buildable:
+        raise RuntimeError(f"Couldn't pull {image.pinned_name}: {why}")
+    logger.warning("Couldn't pull %s, so it's built from its build context: %s", image.pinned_name, why)
+    build(image)
+
+
+async def pull_here(image: DockerImageArtifact) -> None:
+    """``pull`` off the event loop."""
+    await asyncio.to_thread(pull, image)
 
 
 async def saved_here(image: DockerImageArtifact) -> str:

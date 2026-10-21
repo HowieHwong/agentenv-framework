@@ -134,10 +134,14 @@ class _Walk:
         self.written = {write.id for write in plan.writes}
         self.agents = {write.id: write.source for write in plan.writes if write.kind is BundleKind.AGENT}
         self.envs = {write.id: write.source for write in plan.writes if write.kind is BundleKind.ENV}
-        self.built = {write.id: write.source for write in plan.writes if isinstance(write.source, BuiltImage)}
-        # Each image a folder names in a registry, as the store will hold it, so it's checked as a stored one is.
+        self.built = {write.id: write.source for write in plan.writes
+                      if isinstance(write.source, BuiltImage) and write.id not in plan.published}
+        # Each image a folder names in a registry, or the bundle builds from sources whose image is published, as the
+        # store will hold it, so it's checked as a stored one is.
         self.referenced = {write.id: DockerImageArtifact(id=write.id, description="", image_name=write.source.ref)
                            for write in plan.writes if isinstance(write.source, ReferencedImage)}
+        self.referenced.update({id: DockerImageArtifact(id=id, description="", image_name=ref, image_digest=digest)
+                                for id, (ref, digest) in plan.published.items()})
         # Each deploy of an image the bundle builds: (where, what, its provider's links, the images it accepts on each)
         self.uses: dict[str, list[tuple[str, str, list[SandboxProvider], Callable[[SandboxProvider], Accepts]]]] = {}
 

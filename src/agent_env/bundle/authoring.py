@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import tempfile
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar, overload
@@ -253,6 +256,18 @@ def build_context_files(bundle: Bundle, entry: BundleEntry) -> dict[str, Path]:
     if toml.is_file():
         files[toml.name] = toml
     return dict(sorted(files.items()))
+
+
+@contextmanager
+def staged_build_context(bundle: Bundle, entry: BundleEntry) -> Iterator[Path]:
+    """A folder holding a copy of ``build_context_files``, so an image written from it was made from what the ledger
+    hashed."""
+    with tempfile.TemporaryDirectory(prefix="agent-env-build-") as staged:
+        context = Path(staged)
+        for key, path in build_context_files(bundle, entry).items():
+            (context / key).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, context / key)
+        yield context
 
 
 def entry_file(bundle: Bundle, entry: BundleEntry) -> tuple[str, Path]:

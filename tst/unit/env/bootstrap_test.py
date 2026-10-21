@@ -43,15 +43,14 @@ def puts(local_stores, monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("kind, put, contexts", [
-    (GATEWAY, bootstrap.put_gateway_env, [(bootstrap.GATEWAY_CONTEXT, "Dockerfile")]),
-    (SERVICE_DB, bootstrap.put_service_db_env, [(bootstrap.SERVICE_DB_DOCKERFILE.parent, name)
-                                                for name in ("Dockerfile", "Dockerfile.db-web", "Dockerfile.db-mcp")]),
-    (WEBSITE_BROWSER, bootstrap.put_website_browser_env, [(bootstrap.WEBSITE_BROWSER_CONTEXT, "Dockerfile")]),
+@pytest.mark.parametrize("kind, put", [
+    (GATEWAY, bootstrap.put_gateway_env), (SERVICE_DB, bootstrap.put_service_db_env),
+    (WEBSITE_BROWSER, bootstrap.put_website_browser_env),
 ], ids=[GATEWAY, SERVICE_DB, WEBSITE_BROWSER])
-def test_each_infra_image_keeps_the_build_context_it_is_built_from(local_stores, monkeypatch, kind, put, contexts):
+def test_each_infra_image_keeps_the_build_context_it_is_built_from(local_stores, monkeypatch, kind, put):
     """So a VM or Modal running another platform than this machine builds it again from that; and those contexts are
-    what its recorded build inputs cover."""
+    what its recorded build inputs cover. Each Dockerfile is named by its whole path: a bare name is looked up from
+    the current folder first."""
     kept = []
 
     def keep(id, *, description, image_name, build_context_path=None, dockerfile_path=None, platform=None):
@@ -64,8 +63,7 @@ def test_each_infra_image_keeps_the_build_context_it_is_built_from(local_stores,
 
     put("x", platform=None)
 
-    assert kept == contexts
-    assert [folder / name for folder, name in kept] == bootstrap._DOCKERFILES[kind]
+    assert kept == [(dockerfile.parent, str(dockerfile)) for dockerfile in bootstrap._DOCKERFILES[kind]]
 
 
 @pytest.fixture
@@ -258,6 +256,19 @@ def test_a_published_image_is_registered_by_its_tag_and_digest_with_the_context_
     assert get_artifact_store().get_object(image.build_context_object_url)
     assert env.metadata[bootstrap.BUILD_INPUTS_KEY] == bootstrap.build_inputs_digest(GATEWAY)
     assert bootstrap._built_from_stock(env, GATEWAY)
+
+
+def test_a_published_image_is_registered_from_its_own_dockerfile_whatever_folder_the_run_is_in(local_stores, tmp_path,
+                                                                                               monkeypatch):
+    """A run started from a folder holding a Dockerfile of its own registers the gateway's, with its sources."""
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    monkeypatch.chdir(tmp_path)
+
+    image = bootstrap.put_gateway_env("default", platform=None,
+                                      published={bootstrap.GATEWAY_DOCKERFILE: _DIGEST}).docker_image_artifact
+
+    tag = bootstrap._PUBLISHED[bootstrap.GATEWAY_DOCKERFILE].tag()
+    assert (image.dockerfile_path, image.source_digest) == ("Dockerfile", f"sha256:{tag.removeprefix('src-')}")
 
 
 def test_the_default_stores_are_local(local_stores):

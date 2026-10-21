@@ -37,7 +37,7 @@ from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
 from agent_env.task_step.task_steps.verifiers.rubrics_verifier import RubricsVerifierTaskStep
-from tst.unit.bundle._support import layout, local_store
+from tst.unit.bundle._support import layout, local_store, shipped_agent
 
 LOCAL = ("localhost:5000/local/img:v1", "file:///state/img-v1.tar.gz")
 REMOTE = ("123456789012.dkr.ecr.us-west-2.amazonaws.com/img:v1", "s3://bucket/img-v1.tar.gz")
@@ -289,6 +289,22 @@ def test_an_agent_the_bundle_builds_is_refused_on_a_provider_that_creates_no_vm_
         "only once it's built on this machine or by the provider it runs on; run it with --sandbox local, or on a "
         "provider that builds it, such as --sandbox modal",
     ]
+
+
+@pytest.mark.parametrize("sandbox", ["containers", "local"])
+def test_an_agent_built_from_a_shipped_agents_published_sources_is_pulled_wherever_it_deploys(bundle_dir, monkeypatch,
+                                                                                            agents_published, sandbox):
+    """Even on a provider that runs it by name, and on this machine, where it isn't built first."""
+    registry = Config.sandbox_registry
+    monkeypatch.setattr(Config, "sandbox_registry", lambda self: {**registry(self), "containers": {"impl": _ContainersOnly}})
+    shipped_agent(bundle_dir)
+    _task(bundle_dir, [AGENT])
+
+    dry = dry_run_bundle(bundle_dir, sandbox=sandbox)
+
+    assert dry.built_here == frozenset()
+    assert dry.images() == (f"agents/solver (Dockerfile image) v1: {agents_published}, published for its sources, which each deploy "
+                            "pulls by its digest, or builds from its build context when it can't",)
 
 
 def test_a_gateway_is_refused_on_a_provider_that_creates_no_vm_and_has_no_private_network(bundle_dir, monkeypatch):

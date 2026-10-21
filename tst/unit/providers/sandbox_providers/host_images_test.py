@@ -1,8 +1,10 @@
 """Images built from their build context on this machine: natively, once per sources, labeled with them, and saved once
-for a VM here to load."""
+for a VM here to load; and published ones pulled here by their digest."""
 
 import gzip
 import io
+import logging
+import subprocess
 import threading
 import time
 
@@ -10,7 +12,8 @@ import pytest
 
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.providers.sandbox_providers import host_images
-from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox
+from agent_env.providers.sandbox_providers import local_sandbox
+from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, LocalSandboxProvider
 from agent_env.providers.sandbox_providers.sandbox import VmSandbox
 from agent_env.utils.docker.build import DockerBuildError
 
@@ -180,4 +183,93 @@ async def test_a_local_sandbox_given_a_platform_builds_as_a_vm_does(local_stores
     await sandbox.build_images([image])
 
     assert builds == [] and built_in_vm == [image.image_name]
+
+
+_PUBLISHED_REF = "ghcr.io/scaleapi/agentenv-claude-code:src-" + "b" * 64
+_PUBLISHED_DIGEST = "sha256:" + "a" * 64
+_PINNED = f"{_PUBLISHED_REF}@{_PUBLISHED_DIGEST}"
+
+
+def _published(context):
+    return DockerImageArtifact.put_ref("solver__agent_image", description="d", image_name=_PUBLISHED_REF,
+                                       image_digest=_PUBLISHED_DIGEST, context_path=str(context),
+                                       dockerfile_path=str(context / "Dockerfile"))
+
+
+def _docker_cli(monkeypatch, *, held=(), pull_fails=False):
+    """The docker commands ``pull`` runs, each recorded; Docker holds ``held``, and a pull exits 1 when ``pull_fails``."""
+    ran = []
+
+    def run(argv, **kwargs):
+        ran.append(argv[1:])
+        failed = pull_fails and argv[1] == "pull"
+        return subprocess.CompletedProcess(argv, int(failed), "", "Error response from daemon: denied" if failed else "")
+
+    monkeypatch.setattr(host_images, "present", lambda name: name in held)
+    monkeypatch.setattr(host_images.subprocess, "run", run)
+    return ran
+
+
+def test_a_published_image_is_pulled_by_its_digest_and_tagged_with_its_name(local_stores, context, docker,
+                                                                            monkeypatch):
+    ran = _docker_cli(monkeypatch)
+
+    host_images.pull(_published(context))
+
+    assert ran == [["pull", _PINNED], ["tag", _PINNED, _PUBLISHED_REF]]
+    assert docker[0] == []
+
+
+def test_a_published_image_docker_holds_under_its_name_isnt_pulled_again(local_stores, context, docker, monkeypatch):
+    ran = _docker_cli(monkeypatch, held={_PUBLISHED_REF})
+
+    host_images.pull(_published(context))
+
+    assert ran == [] and docker[0] == []
+
+
+def test_a_published_image_that_cant_be_pulled_is_built_from_its_build_context(local_stores, context, docker,
+                                                                              monkeypatch, caplog):
+    ran = _docker_cli(monkeypatch, pull_fails=True)
+
+    with caplog.at_level(logging.WARNING):
+        host_images.pull(_published(context))
+
+    assert ran == [["pull", _PINNED]]
+    assert [tag for _, _, tag, _, _ in docker[0]] == [_PUBLISHED_REF]
+    assert f"Couldn't pull {_PINNED}, so it's built from its build context: Error response from daemon: denied" in (
+        caplog.text)
+
+
+def test_a_published_image_with_no_build_context_that_cant_be_pulled_says_why(monkeypatch):
+    _docker_cli(monkeypatch, pull_fails=True)
+    image = DockerImageArtifact(id="x", version=1, description="d", image_name=_PUBLISHED_REF,
+                                image_digest=_PUBLISHED_DIGEST)
+
+    with pytest.raises(RuntimeError, match=f"Couldn't pull {_PINNED}: Error response from daemon: denied"):
+        host_images.pull(image)
+
+
+@pytest.mark.asyncio
+async def test_the_local_provider_pulls_a_published_image_and_builds_one_that_is_only_its_context(local_stores, context,
+                                                                                                 monkeypatch):
+    """It starts containers from an image by name, so this machine's Docker holds the image first."""
+    pulled, built = [], []
+
+    async def pull_here(image):
+        pulled.append(image.image_name)
+
+    async def build_here(image):
+        built.append(image.image_name)
+
+    monkeypatch.setattr(local_sandbox, "pull_here", pull_here)
+    monkeypatch.setattr(local_sandbox, "build_here", build_here)
+    provider, context_only = LocalSandboxProvider(), _put(context)
+
+    for image in (_published(context), context_only,
+                  DockerImageArtifact(id="t", version=1, description="d", image_name="img:v1",
+                                      tar_gz_object_url="s3://bucket/img.tar.gz")):
+        await provider.prepare_image(image)
+
+    assert (pulled, built) == ([_PUBLISHED_REF], [context_only.image_name])
 

@@ -108,7 +108,7 @@ def _image(label: str, artifact_id: str, description: str, dockerfile: Path, ima
     say(f"Registering the published {label} image {ref}...")
     return DockerImageArtifact.put_ref(artifact_id, description=description, image_name=ref,
                                        image_digest=published[dockerfile], context_path=str(dockerfile.parent),
-                                       dockerfile_path=dockerfile.name)
+                                       dockerfile_path=str(dockerfile))
 
 
 def _build_and_put(label: str, artifact_id: str, description: str, dockerfile: Path, image_name: str, *,
@@ -119,7 +119,7 @@ def _build_and_put(label: str, artifact_id: str, description: str, dockerfile: P
     build_image(dockerfile, dockerfile.parent, image_name, platform=platform)
     say(f"Creating {label} DockerImageArtifact...")
     artifact = DockerImageArtifact.put(id=artifact_id, description=description, image_name=image_name,
-                                       build_context_path=str(dockerfile.parent), dockerfile_path=dockerfile.name)
+                                       build_context_path=str(dockerfile.parent), dockerfile_path=str(dockerfile))
     say(f"Created {label} DockerImageArtifact: id={artifact.id} version={artifact.version}")
     return artifact
 

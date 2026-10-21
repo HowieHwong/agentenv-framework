@@ -11,7 +11,9 @@ on every model call. The `LITELLM_*` variables stay in its environment too, so a
 endpoint. The image holds Claude Code, which is Anthropic's software under its
 [Commercial Terms](https://www.anthropic.com/legal/commercial-terms); a release also publishes the image, CLI included,
 at `ghcr.io/scaleapi/agentenv-claude-code:src-<hex>`, built from this folder with the protocol pinned as the wheel
-ships it. The CLI's version is the Dockerfile's
+ships it. A run that deploys the agent registers that image when it's published for the sources installed: each deploy
+pulls it by its digest and builds it from this folder only when it can't, and a provider that runs images by name can
+run it. The CLI's version is the Dockerfile's
 `CLAUDE_CODE_VERSION`. The image gives the scripts the model runs
 `node`, without npm or npx, and the Python packages `model-requirements.txt` pins.
 

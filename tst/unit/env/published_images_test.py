@@ -1,5 +1,5 @@
-"""The images agent-env publishes for its infra envs: one per shipped Dockerfile, tagged by its sources, and the record
-of their digests a release wheel carries."""
+"""The images agent-env publishes for its infra envs and its agents: one per shipped Dockerfile, tagged by its sources,
+and the record of their digests a release wheel carries."""
 
 import hashlib
 import json
@@ -9,9 +9,11 @@ import pytest
 
 from agent_env.env import bootstrap, published_images
 from agent_env.env.published_images import (
+    AGENT_IMAGES,
     REGISTRY,
     PublishedImage,
     _registry_digest,
+    published_agent_image,
     published_digest,
     release_digests,
     write_release_digests,
@@ -119,3 +121,20 @@ def test_an_image_its_release_didnt_record_is_looked_up_and_only_what_was_served
 
     assert [published_digest(image) for image in (served, missing, served, missing)] == [_DIGEST, None, _DIGEST, None]
     assert asked == [(served.ref(), None, 10), (missing.ref(), None, 10), (missing.ref(), None, 10)]
+
+
+def test_a_shipped_agents_sources_find_its_published_image_and_other_sources_none(monkeypatch):
+    claude_code = AGENT_IMAGES[0]
+    sources = BuildContext.of(claude_code.dockerfile.parent, claude_code.dockerfile).source_digest(None)
+    monkeypatch.setattr(published_images, "_registry_digest", lambda ref: _DIGEST if ref == claude_code.ref() else None)
+
+    assert published_agent_image(sources) == (claude_code.ref(), _DIGEST)
+    assert published_agent_image("sha256:" + "0" * 64) is None
+
+
+def test_a_shipped_agents_sources_whose_image_isnt_published_find_none(monkeypatch):
+    claude_code = AGENT_IMAGES[0]
+    sources = BuildContext.of(claude_code.dockerfile.parent, claude_code.dockerfile).source_digest(None)
+
+    assert published_agent_image(sources) is None
+

@@ -168,6 +168,9 @@ class DryRun:
             f"{_label(plan, done.write)} v{done.version}: "
             + ("pulled from its registry, its tag pinned to a digest when it's written"
                if isinstance(done.write.source, ReferencedImage)
+               else f"{plan.published[done.write.id][0]}, published for its sources, which each deploy pulls by its "
+                    "digest, or builds from its build context when it can't"
+               if done.write.id in plan.published
                else "a build context, built with docker on this machine"
                if done.write.id in self.built_here
                else "a build context, which each deploy builds where it runs, for its sandbox's platform")

@@ -1,6 +1,7 @@
-"""The images agent-env publishes for the infra envs it ships, for linux/amd64 and linux/arm64: one per Dockerfile, built
-from the Dockerfile's folder. Each is tagged by its build context's content, so an install holding the same sources
-finds the image built from them; a release wheel also records the digest its release published under each tag."""
+"""The images agent-env publishes for the infra envs and the agents it ships, for linux/amd64 and linux/arm64: one per
+Dockerfile, built from the Dockerfile's folder. Each is tagged by its build context's content, so an install holding the
+same sources finds the image built from them; a release wheel also records the digest its release published under each
+tag."""
 
 from __future__ import annotations
 
@@ -58,6 +59,18 @@ def published_digest(image: PublishedImage) -> str | None:
     the one the registry serves under its tag now; None when it serves none or can't be asked."""
     ref = image.ref()
     return release_digests(RELEASE_FILE).get(ref) or _registry_digest(ref)
+
+
+def published_agent_image(sources: str) -> tuple[str, str] | None:
+    """The ref and digest of the image published for a shipped agent whose installed build context has the source
+    digest ``sources`` (``BuildContext.source_digest(None)``), or None when no shipped agent has those sources or its
+    image isn't published."""
+    tag = f"src-{sources.removeprefix('sha256:')}"
+    for image in AGENT_IMAGES:
+        if image.tag() == tag:
+            digest = published_digest(image)
+            return (image.ref(), digest) if digest else None
+    return None
 
 
 def _registry_digest(ref: str) -> str | None:

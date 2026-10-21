@@ -38,7 +38,7 @@ except ImportError:  # Windows, which agent-env does not target.
 from agent_env import config
 from agent_env.attribution import Attribution
 from agent_env.config.paths import state_root
-from agent_env.providers.sandbox_providers.host_images import build_here, built_here, present
+from agent_env.providers.sandbox_providers.host_images import build_here, built_here, present, pull_here
 from agent_env.providers.sandbox_providers.sandbox import SANDBOX_LABEL, NetworkPolicy, VmSandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     SANDBOX_MODE_CONTAINER,
@@ -670,9 +670,13 @@ class LocalSandboxProvider(SandboxProvider):
         await start_trusting(sandbox, sandbox.container_name, trust_dir)
 
     async def prepare_image(self, image: Any, *, attribution: Optional[Attribution] = None) -> None:
-        """Build a context-only image on this machine, whose containers the local provider starts by name."""
+        """Have this machine's Docker hold the image the local provider starts containers from by name: one that is only
+        a build context built here, and one with a digest pulled by it, or built from its build context when it can't
+        be."""
         if image.context_only:
             await build_here(image)
+        elif image.image_digest:
+            await pull_here(image)
 
     async def create_sandbox(
         self,

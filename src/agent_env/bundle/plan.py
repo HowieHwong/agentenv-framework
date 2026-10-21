@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from agent_env.a2a_agent import A2AAgent
 from agent_env.artifact import Artifact, CliArtifact, EnvironmentArtifact, SeedsEnvironments
 from agent_env.artifact.artifact import FolderChild
+from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.artifact.registry import canonical_type, get_artifact_registry
 from agent_env.config import get_config
 from agent_env.entity.refs import EntityKind, default_agent_refs
@@ -32,6 +33,7 @@ from agent_env.env.envs._deployment import provider_refusal
 from agent_env.env.envs.mcp_server import MCPServerEnv
 from agent_env.env.envs.multi_env import MultiEnv
 from agent_env.env.envs.website import WebsiteEnv
+from agent_env.env.published_images import published_agent_image
 from agent_env.env.registry import get_env_registry
 from agent_env.env.store import ENVS_COLLECTION
 from agent_env.providers.env_providers.constants import (
@@ -50,7 +52,7 @@ from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
 
 from ._fs import fold, relative, with_article
-from .authoring import AuthoringContext, entry_files
+from .authoring import AuthoringContext, entry_files, staged_build_context
 from .parse import NAMED_BY, Bundle, BundleEntry, BundleError, BundleKind, parse_bundle
 from .resolve import BuiltImage, BundleImage, Reference, ResolvedBundle, ResolvedEntry, build_step, resolve_bundle
 
@@ -97,6 +99,9 @@ class Plan:
     store_refs: tuple[Reference, ...]  # the store ids the writes reference, checked to exist
     store_latest: dict[tuple[EntityKind, str], int]  # the version each unpinned store ref named when planned
     origins: Mapping[BundleEntry, Bundle] = field(default_factory=dict)  # each entry from another bundle, with it
+    # Each agent image the bundle builds from a shipped agent's sources, by id: the ref and digest published for them,
+    # which the run registers in place of its build context alone.
+    published: Mapping[str, tuple[str, str]] = field(default_factory=dict)
 
     def bundle_of(self, entry: BundleEntry) -> Bundle:
         """The bundle ``entry`` comes from: the installed one for an entry pulled in from one, else the run's."""
@@ -295,8 +300,9 @@ class _Planner:
         self._check_loaded_environments(closure, store_latest)
         if self.problems:
             raise BundleError(self.problems)
-        return Plan(self.resolved, self._ordered(closure), tuple(selected_tasks), tuple(selected_evals), store_refs,
-                    store_latest, dict(self.origins))
+        writes = self._ordered(closure)
+        return Plan(self.resolved, writes, tuple(selected_tasks), tuple(selected_evals), store_refs, store_latest,
+                    dict(self.origins), self._published(writes))
 
     def check(self) -> None:
         self._check_writers()
@@ -792,6 +798,24 @@ class _Planner:
                 if waiting[dependent] == 0:
                     heapq.heappush(ready, (self.rank[dependent], dependent))
         return tuple(writes)
+
+    def _published(self, writes: Sequence[Write]) -> dict[str, tuple[str, str]]:
+        """The published image of each agent image in ``writes`` built from a shipped agent's sources, by id. Only an
+        agent's are looked up, as agent-env publishes no other kind of bundle image."""
+        published = {}
+        for write in writes:
+            image = write.source
+            if not (isinstance(image, BuiltImage) and image.entry.kind is BundleKind.AGENT):
+                continue
+            with staged_build_context(self._bundle_of(image.entry), image.entry) as context:
+                try:
+                    sources, _ = DockerImageArtifact.context_identity(write.id, str(context),
+                                                                      str(context / image.dockerfile), platform=None)
+                except ValueError:  # a context its write refuses, which says why
+                    continue
+            if (found := published_agent_image(sources)) is not None:
+                published[write.id] = found
+        return published
 
     def _bundle_of(self, entry: BundleEntry) -> Bundle:
         return self.origins.get(entry, self.resolved.bundle)

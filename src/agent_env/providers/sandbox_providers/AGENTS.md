@@ -55,7 +55,7 @@ with `exposed_ports=[port]` and returns the VM, and the deploy then loads and st
 | `get_sandbox(sandbox_id) -> Sandbox` | yes | every step after the one that created the sandbox, and teardown |
 | `terminate_sandbox(sandbox_id)` | no | teardown. The default calls `get_sandbox` then `terminate()`, and treats `SandboxNotFoundError` as done; override when you can terminate without a live handle |
 | `create_container(...)` | inherited | containers that run an env or agent image. Override only when the platform boots images natively |
-| `prepare_image(image, *, attribution)` | no | before a sandbox is asked for an image, outside any creation deadline; build a context-only image here |
+| `prepare_image(image, *, attribution)` | no | before a sandbox is asked for an image, outside any creation deadline; build a context-only image here, and pull one with an `image_digest` by it, building it from its context when it can't be pulled |
 | `from_config(**config)` | no | receives `[sandbox.providers.<name>.config]` with `secret:` references resolved. Override to fail early with a `ConfigError` that names the missing key (`boxd` also rejects unknown keys) |
 | `close()` | no | release SDK clients |
 
