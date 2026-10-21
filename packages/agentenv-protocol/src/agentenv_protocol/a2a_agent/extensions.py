@@ -287,6 +287,71 @@ class TriggerDecideRequest(ExtensionRequest):
     env_triggers: dict[str, dict[str, Any]] | None = None
 
 
+DRIVER_TOKEN_MIN_LENGTH = 22
+
+
+class DriverClaimRequest(ExtensionRequest):
+    token: str = Field(min_length=DRIVER_TOKEN_MIN_LENGTH)
+
+
+class DriverNextRequest(ExtensionRequest):
+    token: str
+    after: int = Field(default=0, ge=0)
+
+
+class DriverSkill(ExtensionResponse):
+    name: str
+    description: str
+    path: str | None = None
+
+
+class DriverTurn(ExtensionResponse):
+    task_id: str
+    context_id: str
+    text: str
+    system_prompt: str | None = None
+    skills: list[DriverSkill] = Field(default_factory=list)
+
+
+class DriverNextResponse(ExtensionResponse):
+    version: int
+    turns: list[DriverTurn]
+
+
+class DriverReplyRequest(ExtensionRequest):
+    token: str
+    task_id: str
+    text: str | None = None
+    error: str | None = None
+    trajectory: list[dict[str, Any]] = Field(default_factory=list)
+    tool_call_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _text_or_error(self) -> DriverReplyRequest:
+        if (self.text is None) == (self.error is None):
+            raise ValueError("a reply carries exactly one of text and error")
+        return self
+
+
+class DriverExecRequest(ExtensionRequest):
+    token: str
+    command: str
+
+
+class DriverExecResponse(ExtensionResponse):
+    exec_id: str
+
+
+class DriverOutputRequest(ExtensionRequest):
+    token: str
+    exec_id: str
+
+
+class DriverOutputResponse(ExtensionResponse):
+    done: bool
+    output: str | None = None
+
+
 def _tuple(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
@@ -1167,6 +1232,28 @@ INSTALL_V1 = ExtensionDefinition(
     configuration_validator=_configure_install,
 )
 
+DRIVER_V1 = ExtensionDefinition(
+    uri="urn:agentenv:driver/v1",
+    description="Hand the agent's turns to a driver outside its sandbox, and run its commands where the agent works.",
+    endpoint="/ext/driver",
+    core_operations={
+        "claim": _op("claim", "POST", "/ext/driver/claim", RUNTIME, request_model=DriverClaimRequest),
+        "next": _op(
+            "next", "POST", "/ext/driver/next", RUNTIME,
+            request_model=DriverNextRequest, response_model=DriverNextResponse,
+        ),
+        "reply": _op("reply", "POST", "/ext/driver/reply", RUNTIME, request_model=DriverReplyRequest),
+        "exec": _op(
+            "exec", "POST", "/ext/driver/exec", RUNTIME,
+            request_model=DriverExecRequest, response_model=DriverExecResponse,
+        ),
+        "output": _op(
+            "output", "POST", "/ext/driver/output", RUNTIME,
+            request_model=DriverOutputRequest, response_model=DriverOutputResponse,
+        ),
+    },
+)
+
 STANDARD_EXTENSIONS: Mapping[str, ExtensionDefinition] = MappingProxyType(
     {
         extension.uri: extension
@@ -1180,6 +1267,7 @@ STANDARD_EXTENSIONS: Mapping[str, ExtensionDefinition] = MappingProxyType(
             ATTRIBUTION_PROBE_V1,
             TRIGGERS_V1,
             INSTALL_V1,
+            DRIVER_V1,
         )
     }
 )
