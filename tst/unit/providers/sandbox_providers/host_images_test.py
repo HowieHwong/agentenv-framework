@@ -136,22 +136,22 @@ async def test_a_local_sandbox_pulls_only_images_this_machine_didnt_build(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_local_sandbox_doesnt_pull_again_an_image_it_holds_under_a_name_that_never_moves(monkeypatch, docker):
-    """A published source tag, as ``prepare_image`` pulls it by its digest, or a name pinned to a digest; a tag that can
-    move is pulled again whether it's held or not."""
-    pinned = f"ghcr.io/acme/tool:1@{_PUBLISHED_DIGEST}"
+async def test_a_local_sandbox_doesnt_pull_a_tag_again_over_the_image_its_digest_named(monkeypatch, docker):
+    """One ``prepare_image`` pulled by its digest, or held under a name pinned to one; another held tag is pulled again,
+    as is one ``prepare_image`` pulled that Docker no longer holds."""
+    pinned, gone = f"ghcr.io/acme/tool:1@{_PUBLISHED_DIGEST}", "ghcr.io/acme/gone:1"
     held = {_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1"}
     monkeypatch.setattr(local_sandbox, "present", lambda name: name in held)
+    monkeypatch.setattr(host_images, "_PULLED", {_PUBLISHED_REF, gone})
     pulled = []
 
     async def pull(self, names):
         pulled.extend(names)
 
     monkeypatch.setattr(VmSandbox, "pull_images", pull)
-    await LocalSandbox().pull_images([_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1",
-                                      "ghcr.io/scaleapi/agentenv-claude-code:src-" + "c" * 64])
+    await LocalSandbox().pull_images([_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1", gone])
 
-    assert pulled == ["ghcr.io/acme/tool:1", "ghcr.io/scaleapi/agentenv-claude-code:src-" + "c" * 64]
+    assert pulled == ["ghcr.io/acme/tool:1", gone]
 
 
 @pytest.mark.asyncio
@@ -218,6 +218,7 @@ def _published(context):
 def _docker_cli(monkeypatch, *, held=(), pull_fails=False):
     """The docker commands ``pull`` runs, each recorded; Docker holds ``held``, and a pull exits 1 when ``pull_fails``."""
     ran = []
+    monkeypatch.setattr(host_images, "_PULLED", set())
 
     def run(argv, **kwargs):
         ran.append(argv[1:])
@@ -236,7 +237,7 @@ def test_a_published_image_is_pulled_by_its_digest_and_tagged_with_its_name(loca
     host_images.pull(_published(context))
 
     assert ran == [["pull", _PINNED], ["tag", _PINNED, _PUBLISHED_REF]]
-    assert docker[0] == []
+    assert docker[0] == [] and host_images.pulled_here(_PUBLISHED_REF)
 
 
 def test_a_published_image_docker_holds_under_its_name_isnt_pulled_again(local_stores, context, docker, monkeypatch):
@@ -244,7 +245,7 @@ def test_a_published_image_docker_holds_under_its_name_isnt_pulled_again(local_s
 
     host_images.pull(_published(context))
 
-    assert ran == [] and docker[0] == []
+    assert ran == [] and docker[0] == [] and host_images.pulled_here(_PUBLISHED_REF)
 
 
 def test_a_published_image_that_cant_be_pulled_is_built_from_its_build_context(local_stores, context, docker,

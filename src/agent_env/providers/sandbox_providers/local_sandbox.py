@@ -38,8 +38,7 @@ except ImportError:  # Windows, which agent-env does not target.
 from agent_env import config
 from agent_env.attribution import Attribution
 from agent_env.config.paths import state_root
-from agent_env.env.published_images import is_source_tag
-from agent_env.providers.sandbox_providers.host_images import build_here, built_here, present, pull_here
+from agent_env.providers.sandbox_providers.host_images import build_here, built_here, present, pull_here, pulled_here
 from agent_env.providers.sandbox_providers.sandbox import SANDBOX_LABEL, NetworkPolicy, VmSandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     SANDBOX_MODE_CONTAINER,
@@ -225,8 +224,8 @@ class LocalSandbox(VmSandbox):
 
     async def pull_images(self, image_names: list[str]) -> None:
         """Pull each image but one this machine built from a build context, which no registry holds, and one its Docker
-        holds under a name that never moves: pinned to a digest, or a tag agent-env publishes for its sources, which
-        ``prepare_image`` pulls by its digest."""
+        holds that ``prepare_image`` pulled by its digest, or under a name pinned to one, so a tag isn't pulled again
+        over the image its digest names."""
         held = await asyncio.gather(*(asyncio.to_thread(_held_here, name) for name in image_names))
         if pulled := [name for name, here in zip(image_names, held) if not here]:
             await super().pull_images(pulled)
@@ -731,8 +730,8 @@ class LocalSandboxProvider(SandboxProvider):
 
 
 def _held_here(image_name: str) -> bool:
-    """Whether this machine's Docker holds ``image_name`` built here, or under a name that never moves."""
-    return built_here(image_name) or (("@sha256:" in image_name or is_source_tag(image_name)) and present(image_name))
+    """Whether this machine's Docker holds ``image_name`` built here, pulled by its digest, or pinned to one."""
+    return built_here(image_name) or (("@sha256:" in image_name or pulled_here(image_name)) and present(image_name))
 
 
 def host_url_for(url: str, sandbox_type: Optional[str]) -> str:

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _SOURCES_LABEL = "dev.agentenv.sources"
 _SAVED_PREFIX = "host-images"
+_PULLED: set[str] = set()  # the names of the images ``pull`` had this machine's Docker hold, by their digest
 
 
 def host_platform() -> str:
@@ -109,16 +110,23 @@ def pull(image: DockerImageArtifact) -> None:
     pulled or built."""
     with holding_locks([f"image-pull:{image.pinned_name}"]):
         if present(image.image_name):
+            _PULLED.add(image.image_name)
             return
         pulled = subprocess.run(["docker", "pull", image.pinned_name], capture_output=True, text=True, errors="replace")
         if pulled.returncode == 0:
             subprocess.run(["docker", "tag", image.pinned_name, image.image_name], capture_output=True, check=True)
+            _PULLED.add(image.image_name)
             return
     why = (pulled.stderr.strip().splitlines() or [f"docker pull exited {pulled.returncode}"])[-1]
     if not image.buildable:
         raise RuntimeError(f"Couldn't pull {image.pinned_name}: {why}")
     logger.warning("Couldn't pull %s, so it's built from its build context: %s", image.pinned_name, why)
     build(image)
+
+
+def pulled_here(image_name: str) -> bool:
+    """Whether ``pull`` had this machine's Docker hold ``image_name``, by its digest, in this process."""
+    return image_name in _PULLED
 
 
 async def pull_here(image: DockerImageArtifact) -> None:
