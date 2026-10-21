@@ -697,30 +697,30 @@ The answer is agent-wide rather than per caller, and like every extension route 
 probe carries no access check of its own, so expose an agent only to the control plane
 that drives it.
 
-`DRIVER_V1` hands an agent's turns to a driver outside its sandbox, and `StandInAgent`
-(`agentenv_protocol.a2a_agent.stand_in`) serves it. The stand-in has no model: each message
-it gets stays an open turn, its task working, until the driver replies. The driver's first
-`POST /ext/driver/claim` (`{"token"}`, at least 22 characters) sets the token every later
-call carries in its body. A claim with another token gets 409, and any other call with a
-wrong one gets 401. The token is held in memory only, never in the environment a command
-inherits. The other operations:
+`PROXY_V1` hands an agent's turns to a driver outside its sandbox, and `ProxyAgent`
+(`agentenv_protocol.a2a_agent.proxy`) serves it. The proxy has no model: each message it
+gets stays an open turn, its task working, until the driver replies. Its agent-config takes
+`system_prompt` and `role`, and it offers no mcp-config: the driver reaches the envs itself,
+as the role. The driver's first `POST /ext/proxy/claim` (`{"token"}`, at least 22
+characters) sets the token every later call carries in its body. A claim with another token
+gets 409, and any other call with a wrong one gets 401. The token is held in memory only,
+never in the environment a command inherits. The other operations:
 
-- `POST /ext/driver/next` (`{"token", "after"}`) waits up to 25 s for the turns' version to
+- `POST /ext/proxy/next` (`{"token", "after"}`) waits up to 25 s for the turns' version to
   pass `after`, then returns `{"version", "turns": [{"task_id", "context_id", "text",
   "system_prompt", "skills"}]}`. A turn its sender cancels drops out of the list.
-- `POST /ext/driver/reply` (`{"token", "task_id", "text"}` or `"error"` in place of
+- `POST /ext/proxy/reply` (`{"token", "task_id", "text"}` or `"error"` in place of
   `"text"`, plus `"trajectory"` and `"tool_call_count"`) ends a turn. A text is the task's
-  result, an error fails it with `stand_in.driver_error`, and the trajectory's spans become
-  the task's trajectory.
-- `POST /ext/driver/exec` (`{"token", "command"}`) starts `bash -c` in the stand-in's working
-  folder, as its user, and returns `{"exec_id"}`. `POST /ext/driver/output` (`{"token",
+  result, an error fails it with `proxy.driver_error`, and the trajectory's spans become the
+  task's trajectory, as format `agentenv-proxy/v1`.
+- `POST /ext/proxy/exec` (`{"token", "command"}`) starts `bash -c` in the proxy's working
+  folder, as its user, and returns `{"exec_id"}`. `POST /ext/proxy/output` (`{"token",
   "exec_id"}`) waits up to 25 s and returns `{"done", "output"}`. The output is stdout then
   stderr, or an error line after 3600 s, when the command's process group is killed.
 
-Skills the stand-in is given are written to `~/skills/<name>/`, and a turn names each one's
-folder. `StandInAgent(shell=False)` stands in for an agent that works in no sandbox: it keeps
-no skills and refuses `exec`. Commands inherit the stand-in's environment, so run it with no
-credentials in it.
+Skills the proxy is given are written to `~/skills/<name>/`, and a turn names each one's
+folder. Commands inherit the proxy's environment, so run it with no credentials in it, and
+expose it only to the control plane that drives it.
 
 Runnable, self-contained reference agents live in [`examples/`](https://github.com/scaleapi/agentenv-framework/tree/main/packages/agentenv-protocol/examples):
 the normal, streaming, and multimodal `run(request)` paths, single- and

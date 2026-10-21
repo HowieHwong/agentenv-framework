@@ -287,38 +287,38 @@ class TriggerDecideRequest(ExtensionRequest):
     env_triggers: dict[str, dict[str, Any]] | None = None
 
 
-DRIVER_TOKEN_MIN_LENGTH = 22
+PROXY_TOKEN_MIN_LENGTH = 22
 
 
-class DriverClaimRequest(ExtensionRequest):
-    token: str = Field(min_length=DRIVER_TOKEN_MIN_LENGTH)
+class ProxyClaimRequest(ExtensionRequest):
+    token: str = Field(min_length=PROXY_TOKEN_MIN_LENGTH)
 
 
-class DriverNextRequest(ExtensionRequest):
+class ProxyNextRequest(ExtensionRequest):
     token: str
     after: int = Field(default=0, ge=0)
 
 
-class DriverSkill(ExtensionResponse):
+class ProxySkill(ExtensionResponse):
     name: str
     description: str
-    path: str | None = None
+    path: str
 
 
-class DriverTurn(ExtensionResponse):
+class ProxyTurn(ExtensionResponse):
     task_id: str
     context_id: str
     text: str
     system_prompt: str | None = None
-    skills: list[DriverSkill] = Field(default_factory=list)
+    skills: list[ProxySkill] = Field(default_factory=list)
 
 
-class DriverNextResponse(ExtensionResponse):
+class ProxyNextResponse(ExtensionResponse):
     version: int
-    turns: list[DriverTurn]
+    turns: list[ProxyTurn]
 
 
-class DriverReplyRequest(ExtensionRequest):
+class ProxyReplyRequest(ExtensionRequest):
     token: str
     task_id: str
     text: str | None = None
@@ -327,27 +327,27 @@ class DriverReplyRequest(ExtensionRequest):
     tool_call_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def _text_or_error(self) -> DriverReplyRequest:
+    def _text_or_error(self) -> ProxyReplyRequest:
         if (self.text is None) == (self.error is None):
             raise ValueError("a reply carries exactly one of text and error")
         return self
 
 
-class DriverExecRequest(ExtensionRequest):
+class ProxyExecRequest(ExtensionRequest):
     token: str
     command: str
 
 
-class DriverExecResponse(ExtensionResponse):
+class ProxyExecResponse(ExtensionResponse):
     exec_id: str
 
 
-class DriverOutputRequest(ExtensionRequest):
+class ProxyOutputRequest(ExtensionRequest):
     token: str
     exec_id: str
 
 
-class DriverOutputResponse(ExtensionResponse):
+class ProxyOutputResponse(ExtensionResponse):
     done: bool
     output: str | None = None
 
@@ -1232,24 +1232,24 @@ INSTALL_V1 = ExtensionDefinition(
     configuration_validator=_configure_install,
 )
 
-DRIVER_V1 = ExtensionDefinition(
-    uri="urn:agentenv:driver/v1",
-    description="Hand the agent's turns to a driver outside its sandbox, and run its commands where the agent works.",
-    endpoint="/ext/driver",
+PROXY_V1 = ExtensionDefinition(
+    uri="urn:agentenv:proxy/v1",
+    description="Hand the agent's turns to a driver outside its sandbox, and run the driver's commands where the agent works.",
+    endpoint="/ext/proxy",
     core_operations={
-        "claim": _op("claim", "POST", "/ext/driver/claim", RUNTIME, request_model=DriverClaimRequest),
+        "claim": _op("claim", "POST", "/ext/proxy/claim", RUNTIME, request_model=ProxyClaimRequest),
         "next": _op(
-            "next", "POST", "/ext/driver/next", RUNTIME,
-            request_model=DriverNextRequest, response_model=DriverNextResponse,
+            "next", "POST", "/ext/proxy/next", RUNTIME,
+            request_model=ProxyNextRequest, response_model=ProxyNextResponse,
         ),
-        "reply": _op("reply", "POST", "/ext/driver/reply", RUNTIME, request_model=DriverReplyRequest),
+        "reply": _op("reply", "POST", "/ext/proxy/reply", RUNTIME, request_model=ProxyReplyRequest),
         "exec": _op(
-            "exec", "POST", "/ext/driver/exec", RUNTIME,
-            request_model=DriverExecRequest, response_model=DriverExecResponse,
+            "exec", "POST", "/ext/proxy/exec", RUNTIME,
+            request_model=ProxyExecRequest, response_model=ProxyExecResponse,
         ),
         "output": _op(
-            "output", "POST", "/ext/driver/output", RUNTIME,
-            request_model=DriverOutputRequest, response_model=DriverOutputResponse,
+            "output", "POST", "/ext/proxy/output", RUNTIME,
+            request_model=ProxyOutputRequest, response_model=ProxyOutputResponse,
         ),
     },
 )
@@ -1267,7 +1267,7 @@ STANDARD_EXTENSIONS: Mapping[str, ExtensionDefinition] = MappingProxyType(
             ATTRIBUTION_PROBE_V1,
             TRIGGERS_V1,
             INSTALL_V1,
-            DRIVER_V1,
+            PROXY_V1,
         )
     }
 )
