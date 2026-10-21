@@ -1,0 +1,3 @@
+# A release pins agentenv-framework-protocol to the version it was released with. The floor is the first that ships
+# StandInAgent and driver/v1.
+agentenv-framework-protocol[agent]>=0.1.356

@@ -312,7 +312,7 @@ def test_the_trust_lines_resolve_as_the_trust_env_param():
     resolvers = _build_param_resolvers(container_name="c", work_dir="/w", agent_ctx_tar="/w/a.tgz", a2a_port=8000,
                                        config=None, agent_name="a", trust_lines="SSL_CERT_FILE=/x\n")
     assert resolvers["trust_env"]() == "SSL_CERT_FILE=/x\n"
-STAND_IN = "@local/agentenv-stand-in"
+STAND_IN = "@local/agentenv-framework/agents/stand-in"
 CODEX_INSTALL = {"params": {"workdir_host": "/opt/agent-{agent_name}/workspace", "user_host": "agent-{agent_name}",
                             "install_commands_host": ["install codex"], "a2a_port": 8000}}
 STAND_IN_INSTALL = {"params": {"install_commands_host": ["serve as {user} in {workdir} on {a2a_port}"],

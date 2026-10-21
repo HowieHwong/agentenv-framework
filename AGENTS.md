@@ -204,7 +204,8 @@ orchestrators call it the same way. What callers rely on:
   `context.heartbeat()`, a no-op without one. The key is in `_REDACTED_KEYS`, so it is never persisted.
 - An episode (`EpisodeSpec`, `task/episode/`) is one `Task.run()` of a copy of the task, with
   namespace routing on, in which each of its `trainer_agents` is played through a stand-in agent
-  (`agentenv_protocol.a2a_agent.stand_in`, written as `@local/agentenv-stand-in` from its build context).
+  (the `agents` bundle's `stand-in`, `@local/agentenv-framework/agents/stand-in`, which the episode writes
+  from its folder as a bundle run would).
   The agent's `deploy_agent` or `install_agent`, wrapped as `episode_agent`, deploys the stand-in in the
   agent's place when the task uses the agent's sandbox and serves it in this process when it doesn't;
   the agent's `prompt_agent` steps message it as they would the agent, and the caller plays each

@@ -5,12 +5,15 @@ from typing import Any, ClassVar, Optional
 
 from agent_env.a2a_agent import protocol
 from agent_env.a2a_agent.a2a_agent import A2AAgent
-from agent_env.a2a_agent.stand_in import STAND_IN_AGENT_ID, stand_in_agent
+from agent_env.bundle.installed import write_installed
 from agent_env.task.episode.run import _episode_of
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.deploy_agent import bound_deployment, live_mcp_url
+
+# The agents bundle's stand-in, deployed in the place of an agent an episode plays.
+STAND_IN_AGENT_ID = "@local/agentenv-framework/agents/stand-in"
 
 
 class _EpisodeAgentStep(TaskStep):
@@ -52,7 +55,7 @@ class _EpisodeAgentStep(TaskStep):
                 config = A2AAgent.negotiate_agent_config(deployed.a2a_card, {"system_prompt": system_prompt})
                 await protocol.post_agent_config(deployed.a2a_url + config.endpoint, config.fields)
             return context
-        await asyncio.to_thread(stand_in_agent)
+        await asyncio.to_thread(write_installed, STAND_IN_AGENT_ID)
         override = {"a2a_agent_id": STAND_IN_AGENT_ID} if self.step.type == "deploy_agent" else {
             "stand_in": STAND_IN_AGENT_ID}
         step_params = context.metadata.setdefault("user_overrides", {}).setdefault("step_params", {})

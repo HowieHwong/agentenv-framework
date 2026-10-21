@@ -1,7 +1,7 @@
 """Which steps a task may have when some of its agents are played from outside AgentEnv, and why the others are refused.
 
-An outside agent is played through a stand-in agent deployed in its place (``agentenv_protocol.a2a_agent.stand_in``),
-so steps that act on the agent, or in its sandbox, act on the stand-in. Every registered step type is either checked
+An outside agent is played through a stand-in agent deployed in its place (the ``agents`` bundle's ``stand-in``), so
+steps that act on the agent, or in its sandbox, act on the stand-in. Every registered step type is either checked
 here (``CHECKS``) or listed as untouched by an outside agent (``UNAFFECTED``). A test holds the registry to the two, so
 a new step type is classified before an episode runs it. Plugin step types aren't inspected.
 """

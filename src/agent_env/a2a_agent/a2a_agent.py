@@ -120,6 +120,7 @@ class A2AAgent:
     # What an agent.toml's [metadata] may set: the types each key takes, and how a problem names them.
     toml_metadata: ClassVar[dict[str, tuple[tuple[type, ...], str]]] = {
         "default_model": ((str,), "a string"), "min_disk_size_gb": ((int, float), "a number"),
+        TAKES_CREDENTIALS: ((bool,), "true or false"),
     }
 
     EXT_MCP_CONFIG: ClassVar[str] = "urn:agentenv:mcp-config/v1"
@@ -370,10 +371,10 @@ class A2AAgent:
 
     def to_toml(self, out: ExportContext) -> dict[str, Any]:
         """The agent.toml of a folder this agent is built from, which ``from_toml`` reads back as it."""
-        metadata = {key: value for key, value in self.metadata.items() if key in self.toml_metadata
-                    and isinstance(value, self.toml_metadata[key][0]) and not isinstance(value, bool)}
+        metadata = {key: value for key, value in self.metadata.items()
+                    if key in self.toml_metadata and self._fits_toml_metadata(key, value)}
         if dropped := sorted(set(self.metadata) - set(metadata)):
-            out.left_out("metadata", f"an agent.toml's [metadata] takes only {' and '.join(self.toml_metadata)}, not "
+            out.left_out("metadata", f"an agent.toml's [metadata] takes only {self._toml_metadata_keys()}, not "
                                      f"{', '.join(dropped)}")
         toml: dict[str, Any] = {"image": out.image(self.docker_image_artifact)}
         if self.default_env_vars:
@@ -390,15 +391,25 @@ class A2AAgent:
         for name, value in fields.get("metadata", {}).items():
             if name not in cls.toml_metadata:
                 values.append(f"unknown [metadata] key {name!r}; an agent's [metadata] takes "
-                              f"{' and '.join(cls.toml_metadata)}")
+                              f"{cls._toml_metadata_keys()}")
                 continue
-            kinds, described = cls.toml_metadata[name]
-            if isinstance(value, bool) or not isinstance(value, kinds):
-                values.append(f"metadata.{name} must be {described}, not {value!r}")
+            if not cls._fits_toml_metadata(name, value):
+                values.append(f"metadata.{name} must be {cls.toml_metadata[name][1]}, not {value!r}")
         problems += [ctx.config_problem(problem) for problem in values]
         if problems:
             ctx.refuse(problems)
         return fields
+
+    @classmethod
+    def _toml_metadata_keys(cls) -> str:
+        *rest, last = cls.toml_metadata
+        return f"{', '.join(rest)} and {last}"
+
+    @classmethod
+    def _fits_toml_metadata(cls, name: str, value: Any) -> bool:
+        """A bool is an int to ``isinstance``, so it fits only a key that takes one."""
+        kinds = cls.toml_metadata[name][0]
+        return isinstance(value, kinds) and (bool in kinds or not isinstance(value, bool))
 
     @classmethod
     def get(cls, id: str, version: Optional[int] = None) -> A2AAgent:

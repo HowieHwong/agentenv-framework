@@ -26,5 +26,12 @@ the `[model]` endpoint as an OpenAI-compatible one and takes its model from the 
 `[model] default` (or the `agent` role) set. It declares `install/v1` too, for Debian or Ubuntu targets.
 Its folder's `README.md` covers the extensions it implements.
 
+`agents/stand-in/` is the Episode API's, not an agent to pick for a task. It's the protocol's `StandInAgent`, which
+has no model: an episode deploys it in the place of the agent its caller plays, answers its turns through
+`urn:agentenv:driver/v1`, and runs the caller's `bash` in it. Its image works in `/app` as user `agent`. On a `vm`
+sandbox's host, `install.sh` installs it where the agent it replaces says it works, with the host's own Python in a
+venv. Its `agent.toml` sets `takes_credentials = false`, so it's given no model key or store credentials. It has no
+smoke task: with nobody answering its turns, a prompt only waits out its deadline.
+
 `agent-env run agents` runs every agent's smoke task, building each image; `--task claude-code-smoke` runs Claude
 Code's alone, `--task pi-smoke` pi's.
