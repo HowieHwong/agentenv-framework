@@ -974,18 +974,18 @@ class PromptAgentTaskStep(TaskStep):
         mark = min((m for m, _, _ in pending), default=None)
         if mark is None or (end is not None and mark > end):
             if end is not None:
-                await self._move_env_clocks(envs, end, check_marks=False)
+                await self._move_env_clocks(envs, end)
             return {"stopped": "end_time" if mark is not None else "no_pending_time_triggers",
                     "virtual_time": _iso(end) if end is not None else None}
         due = [(d, t) for m, d, t in pending if m == mark]
-        moved = await self._move_env_clocks(envs, mark, check_marks=True)
+        moved = await self._move_env_clocks(envs, mark)
         statuses = await self._wait_fired(context, due, advance["fire_timeout_seconds"])
         # A mark whose trigger didn't settle is not chosen again, so an unfinished fire can't hold time still.
         timed_out.update((d.env_id, t["id"], t["next_mark"]) for d, t in due if statuses[d.env_id][t["id"]] == "timeout")
         trigger_ids = list(dict.fromkeys(t["id"] for _, t in due))
         return {"mark": _iso(mark), "trigger_ids": trigger_ids, "statuses": statuses, "moved": moved}
 
-    async def _move_env_clocks(self, envs: list, target: datetime, *, check_marks: bool) -> dict:
+    async def _move_env_clocks(self, envs: list, target: datetime) -> dict:
         """Bring each env clock behind ``target`` up to it, by advance where offered, else a re-arm only fixed marks survive."""
         moved = {}
         for d, clock, rows in envs:
@@ -994,7 +994,7 @@ class PromptAgentTaskStep(TaskStep):
             if d.supports(EXT_CLOCK_URI, "advance"):
                 moved[d.env_id] = await self._advance_clock(d, target)
                 continue
-            unsafe = [t["id"] for t in rows if check_marks and t.get("type") == "time"
+            unsafe = [t["id"] for t in rows if t.get("type") == "time"
                       and t.get("status") in _SCHEDULED_STATUSES and not _rearm_safe(t.get("when") or {})]
             if unsafe:
                 raise RuntimeError(f"{self.id}: env '{d.env_id}' has no clock advance, and a re-arm would re-anchor the "

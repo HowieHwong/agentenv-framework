@@ -319,6 +319,16 @@ async def test_a_gateway_without_advance_refuses_to_rearm_over_a_relative_mark(m
 
 
 @pytest.mark.asyncio
+async def test_a_gateway_without_advance_refuses_to_rearm_to_end_time_over_a_relative_mark(monkeypatch):
+    _wire(monkeypatch)
+    env = _Env({"reminder": "P1D"}, advance=False)
+
+    with pytest.raises(RuntimeError, match=r"re-anchor .*\['reminder'\]"):
+        await _step({"mode": "next_env_event", "end_time": "2026-03-02T20:00:00Z"}).execute(_context(env))
+    assert env.moves() == []
+
+
+@pytest.mark.asyncio
 async def test_a_failed_or_stuck_trigger_is_reported_and_the_agent_still_woken(monkeypatch):
     seen = _wire(monkeypatch)
     failed = await _step("next_env_event", turns=2).execute(_context(_Env({"e": DAY1}, outcome="failed")))
