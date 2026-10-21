@@ -476,13 +476,30 @@ def test_an_agent_image_from_a_shipped_agents_sources_is_registered_as_its_publi
     materialize(plan, build_here=local_builds(plan))
 
     written = DockerImageArtifact.get(image, 1)
-    assert plan.published == {image: (agents_published, DIGEST)}
+    assert [(found.ref, found.digest) for found in plan.published.values()] == [(agents_published, DIGEST)]
     assert (written.image_name, written.image_digest, written.pinned_name) == (
         agents_published, DIGEST, f"{agents_published}@{DIGEST}")
     assert written.source_digest == f"sha256:{AGENT_IMAGES[0].tag().removeprefix('src-')}"
     assert written.buildable and not written.context_only and written.tar_gz_object_url is None
     assert builds == []
     assert A2AAgent.get(f"{ROOT}/solver").docker_image_artifact.image_digest == DIGEST
+
+
+def test_an_agent_image_whose_sources_change_after_planning_isnt_registered_as_the_published_one(
+        bundle_dir, builds, agents_published):
+    """Its image and its build context would be of different sources."""
+    folder = shipped_agent(bundle_dir)
+    _steps(bundle_dir, [{"id": "agent", "type": "deploy_agent", "env_ids": [], "a2a_agent_id": "solver"}])
+    plan = plan_of(bundle_dir)
+    (folder / "kit.py").write_text("# changed after the run planned it\n")
+
+    with pytest.raises(BundleError) as e:
+        materialize(plan, build_here=local_builds(plan))
+
+    assert list(e.value.problems) == [f"agents/solver: its files changed after the run found {agents_published} "
+                                      "published for them; run it again"]
+    with pytest.raises(NotFoundError):
+        DockerImageArtifact.get(f"{ROOT}/solver__agent_image")
 
 
 def test_an_agent_image_from_sources_no_shipped_agent_has_is_its_build_context(bundle_dir, builds, agents_published):

@@ -81,6 +81,19 @@ _NOTHING_TO_RUN = "this bundle has no tasks or evals to run"
 
 
 @dataclass(frozen=True)
+class Publication:
+    """The image published for the sources a bundle builds an agent's image from."""
+
+    ref: str  # its repository and source tag
+    digest: str
+    sources: str  # the source digest of the build context it was found for
+
+    @property
+    def pinned(self) -> str:
+        return f"{self.ref}@{self.digest}"
+
+
+@dataclass(frozen=True)
 class Write:
     """An entity or built image a run writes."""
 
@@ -99,9 +112,9 @@ class Plan:
     store_refs: tuple[Reference, ...]  # the store ids the writes reference, checked to exist
     store_latest: dict[tuple[EntityKind, str], int]  # the version each unpinned store ref named when planned
     origins: Mapping[BundleEntry, Bundle] = field(default_factory=dict)  # each entry from another bundle, with it
-    # Each agent image the bundle builds from a shipped agent's sources, by id: the ref and digest published for them,
-    # which the run registers in place of its build context alone.
-    published: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    # Each agent image the bundle builds from a shipped agent's sources, by id: the image published for them, which the
+    # run registers in place of its build context alone.
+    published: Mapping[str, Publication] = field(default_factory=dict)
 
     def bundle_of(self, entry: BundleEntry) -> Bundle:
         """The bundle ``entry`` comes from: the installed one for an entry pulled in from one, else the run's."""
@@ -799,7 +812,7 @@ class _Planner:
                     heapq.heappush(ready, (self.rank[dependent], dependent))
         return tuple(writes)
 
-    def _published(self, writes: Sequence[Write]) -> dict[str, tuple[str, str]]:
+    def _published(self, writes: Sequence[Write]) -> dict[str, Publication]:
         """The published image of each agent image in ``writes`` built from a shipped agent's sources, by id. Only an
         agent's are looked up, as agent-env publishes no other kind of bundle image."""
         published = {}
@@ -814,7 +827,7 @@ class _Planner:
                 except ValueError:  # a context its write refuses, which says why
                     continue
             if (found := published_agent_image(sources)) is not None:
-                published[write.id] = found
+                published[write.id] = Publication(*found, sources)
         return published
 
     def _bundle_of(self, entry: BundleEntry) -> Bundle:

@@ -21,6 +21,7 @@ REGISTRY = "ghcr.io/scaleapi"
 # The release workflow writes this into the wheels it publishes; a checkout, or a wheel built elsewhere, has none.
 RELEASE_FILE = Path(__file__).with_name("published_images.json")
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+_SOURCE_TAG = re.compile(rf"^{re.escape(REGISTRY)}/[a-z0-9._-]+:src-[0-9a-f]{{64}}$")
 # Short, so a network that drops requests doesn't hold up a run's checks for long.
 _LOOKUP_TIMEOUT_SECONDS = 10
 _SERVED: dict[str, str] = {}  # the digest the registry served each ref under, which never changes: no tag is moved
@@ -52,6 +53,11 @@ class PublishedImage:
 
 # The images of the agents agent-env ships that its releases publish, Claude Code's CLI included: the default agent's.
 AGENT_IMAGES = (PublishedImage("agentenv-claude-code", _AGENTS / "claude-code" / "Dockerfile"),)
+
+
+def is_source_tag(image_name: str) -> bool:
+    """Whether ``image_name`` is a tag agent-env publishes an image under, which names its sources and is never moved."""
+    return bool(_SOURCE_TAG.match(image_name))
 
 
 def published_digest(image: PublishedImage) -> str | None:

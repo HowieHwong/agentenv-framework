@@ -127,7 +127,7 @@ class Ledger:
             for key, path in listing(self._plan.bundle_of(write.source.entry), write.source.entry).items():
                 inputs["files"][key] = _file_sha256(path) + (_mode(path) if built else "")
         if (published := self._plan.published.get(write.id)) is not None:
-            inputs["published"] = "@".join(published)
+            inputs["published"] = published.pinned
         if write.kind not in (BundleKind.TASK, BundleKind.EVAL):
             # A document records the versions of what it references (an env its images, a universe its
             # environments), so one written anew means it must be written again. A task or eval names its

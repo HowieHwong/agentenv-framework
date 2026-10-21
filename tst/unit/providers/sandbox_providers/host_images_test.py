@@ -136,6 +136,25 @@ async def test_a_local_sandbox_pulls_only_images_this_machine_didnt_build(monkey
 
 
 @pytest.mark.asyncio
+async def test_a_local_sandbox_doesnt_pull_again_an_image_it_holds_under_a_name_that_never_moves(monkeypatch, docker):
+    """A published source tag, as ``prepare_image`` pulls it by its digest, or a name pinned to a digest; a tag that can
+    move is pulled again whether it's held or not."""
+    pinned = f"ghcr.io/acme/tool:1@{_PUBLISHED_DIGEST}"
+    held = {_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1"}
+    monkeypatch.setattr(local_sandbox, "present", lambda name: name in held)
+    pulled = []
+
+    async def pull(self, names):
+        pulled.extend(names)
+
+    monkeypatch.setattr(VmSandbox, "pull_images", pull)
+    await LocalSandbox().pull_images([_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1",
+                                      "ghcr.io/scaleapi/agentenv-claude-code:src-" + "c" * 64])
+
+    assert pulled == ["ghcr.io/acme/tool:1", "ghcr.io/scaleapi/agentenv-claude-code:src-" + "c" * 64]
+
+
+@pytest.mark.asyncio
 async def test_a_local_sandbox_builds_a_context_with_this_machines_docker(local_stores, context, docker):
     builds, _ = docker
     image = _put(context)

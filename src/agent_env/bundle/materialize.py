@@ -173,16 +173,21 @@ def _write_build_context(plan: Plan, write: Write, here: bool, on_build: Callabl
 
 def _write_published_image(plan: Plan, write: Write) -> int:
     """Register the image published for the sources an entry's Dockerfile builds, by its digest, with its build context
-    beside it, which a sandbox that can't pull the image builds it from; nothing is built here."""
-    image = write.source
-    ref, digest = plan.published[write.id]
+    beside it, which a sandbox that can't pull the image builds it from; nothing is built here. Refused when the
+    sources changed since the run planned it, so the image and its context are never of different sources."""
+    image, published = write.source, plan.published[write.id]
     with staged_build_context(plan.bundle_of(image.entry), image.entry) as context:
         try:
+            dockerfile = str(context / image.dockerfile)
+            sources, _ = DockerImageArtifact.context_identity(write.id, str(context), dockerfile, platform=None)
+            if sources != published.sources:
+                raise ValueError(f"its files changed after the run found {published.ref} published for them; "
+                                 "run it again")
             return DockerImageArtifact.put_ref(
-                write.id, description=_image_description(plan, write), image_name=ref, image_digest=digest,
-                context_path=str(context), dockerfile_path=str(context / image.dockerfile),
+                write.id, description=_image_description(plan, write), image_name=published.ref,
+                image_digest=published.digest, context_path=str(context), dockerfile_path=dockerfile,
             ).version
-        except (ValueError, RuntimeError) as e:  # a context it can't write, or the object store
+        except (ValueError, RuntimeError) as e:  # changed sources, a context it can't write, or the object store
             raise BundleError([f"{_path(plan, write)}: {e}"]) from None
 
 

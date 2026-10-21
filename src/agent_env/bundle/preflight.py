@@ -140,8 +140,9 @@ class _Walk:
         # store will hold it, so it's checked as a stored one is.
         self.referenced = {write.id: DockerImageArtifact(id=write.id, description="", image_name=write.source.ref)
                            for write in plan.writes if isinstance(write.source, ReferencedImage)}
-        self.referenced.update({id: DockerImageArtifact(id=id, description="", image_name=ref, image_digest=digest)
-                                for id, (ref, digest) in plan.published.items()})
+        self.referenced.update({id: DockerImageArtifact(id=id, description="", image_name=found.ref,
+                                                        image_digest=found.digest)
+                                for id, found in plan.published.items()})
         # Each deploy of an image the bundle builds: (where, what, its provider's links, the images it accepts on each)
         self.uses: dict[str, list[tuple[str, str, list[SandboxProvider], Callable[[SandboxProvider], Accepts]]]] = {}
 
