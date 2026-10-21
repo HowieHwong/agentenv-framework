@@ -39,6 +39,7 @@ from agent_env.entity.scopes import FieldScope
 from agent_env.store.base import NotFoundError
 from agent_env.store.ids import is_local_id
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
+from agent_env.task_step.task_steps.verifiers.run_context import Run, load_run_context, render_run_context
 from agent_env.task_step.task_steps.verifiers.scoring import ScoreAggregator, aggregate_score
 from agent_env.task_step.task_steps.sandbox_utils.sandbox_utils import (
     agent_error_text,
@@ -229,6 +230,18 @@ def resolve_context_facts(facts: dict[str, str], metadata: dict) -> list[tuple[s
     return rendered
 
 
+# What of the run beyond its trajectory `run_context_for_judge` may show the judge.
+RUN_CONTEXT_PARTS = ("conversation", "trigger_log")
+
+
+def _validated_run_context_parts(parts: Optional[list[str]]) -> Optional[list[str]]:
+    if parts is None:
+        return None
+    if not isinstance(parts, list) or not parts or any(p not in RUN_CONTEXT_PARTS for p in parts):
+        raise ValueError(f"run_context_for_judge must be a non-empty list of {list(RUN_CONTEXT_PARTS)}, got {parts!r}")
+    return list(dict.fromkeys(parts))
+
+
 # Only fall back from structured output when the error clearly says the response
 # format itself is unsupported. Image/provider/transient failures should retry as-is.
 _SCHEMA_TERMS = (
@@ -398,6 +411,8 @@ class RubricsVerifierTaskStep(TaskStep):
     )
     DEFAULT_MAX_RETRIES: ClassVar[int] = 3
     DEFAULT_POLL_INTERVAL_SECONDS: ClassVar[int] = 10
+    RUN_CONTEXT_MESSAGE_MAX_CHARS: ClassVar[int] = 4000  # a longer message is cut and ends in "…"
+    RUN_CONTEXT_FIRINGS_MAX: ClassVar[int] = 200  # the most recent trigger firings; the rest are counted
     TRAJECTORY_CONTAINER_PATH: ClassVar[str] = "/tmp/prompt_trajectory.json"
     # Multi-turn agent judge: base for a per-run subdir holding turn_NN.json files.
     TRAJECTORY_CONTAINER_DIR: ClassVar[str] = "/tmp/prompt_trajectory_turns"
@@ -435,12 +450,15 @@ class RubricsVerifierTaskStep(TaskStep):
         grading_policy_prompt: Optional[str] = None,
         context_facts_for_judge: Optional[dict[str, str]] = None,
         grade_up_to_turn: Optional[int] = None,
+        run_context_for_judge: Optional[list[str]] = None,
         judge_batch_size: Optional[int] = None,
         judge_batch_concurrency: Optional[int] = None,
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        # RUN_CONTEXT_PARTS the judge also sees, cut at grade_up_to_turn like the trajectory.
+        self.run_context_for_judge = _validated_run_context_parts(run_context_for_judge)
         # Split the criteria into batches of this many, each graded by its own judge call (up to
         # judge_batch_concurrency at once), and retry a batch whose rows read as bulk verdicts.
         self.judge_batch_size = _validated_batch_option("judge_batch_size", judge_batch_size)
@@ -564,6 +582,8 @@ class RubricsVerifierTaskStep(TaskStep):
         base["context_facts_for_judge"] = self.context_facts_for_judge
         if self.grade_up_to_turn is not None:
             base["grade_up_to_turn"] = self.grade_up_to_turn
+        if self.run_context_for_judge is not None:
+            base["run_context_for_judge"] = self.run_context_for_judge
         if self.judge_batch_size is not None:
             base["judge_batch_size"] = self.judge_batch_size
         if self.judge_batch_concurrency is not None:
@@ -597,6 +617,7 @@ class RubricsVerifierTaskStep(TaskStep):
             grading_policy_prompt=data.get("grading_policy_prompt"),
             context_facts_for_judge=data.get("context_facts_for_judge"),
             grade_up_to_turn=data.get("grade_up_to_turn"),
+            run_context_for_judge=data.get("run_context_for_judge"),
             judge_batch_size=data.get("judge_batch_size"),
             judge_batch_concurrency=data.get("judge_batch_concurrency"),
         )
@@ -627,13 +648,19 @@ class RubricsVerifierTaskStep(TaskStep):
                 f"Verifier '{self.verifier_id}': grade_up_to_turn={grade_up_to_turn} needs "
                 "use_trajectory=True — turn k's reply is only in its trajectory."
             )
-        prompt_response = as_of
+        stored_response, prompt_response = prompt_response, as_of
 
         if prompt_response.error_type:
             logger.warning(f"Skipping verification '{self.verifier_id}': prompt had error_type={prompt_response.error_type}")
             self._write_skipped_entries(
                 context, "prompt_error", f"Skipped: prompt had error_type={prompt_response.error_type}")
             return context
+        run_context = None
+        if self.run_context_for_judge:
+            # The stored response, not the cut copy: the loader finds the prompt's place among the run's by identity.
+            run_context = await load_run_context(context, stored_response)
+            if grade_up_to_turn is not None:
+                run_context = run_context.as_of(grade_up_to_turn)
 
         per_turn_uris = [u for u in (prompt_response.target_agent_per_turn_trajectory_object_urls or []) if u]
         if self.use_trajectory and not (per_turn_uris or prompt_response.agent_trajectory_object_url):
@@ -823,6 +850,7 @@ class RubricsVerifierTaskStep(TaskStep):
                         trajectory_path=trajectory_path,
                         loaded_artifacts=loaded_for_judge,
                         context_facts=context_facts,
+                        run_context=run_context,
                     )
                     if self.use_trajectory and multiturn:
                         prompt += self._MULTITURN_DIR_NOTE.format(n=len(per_turn_uris))
@@ -835,6 +863,7 @@ class RubricsVerifierTaskStep(TaskStep):
                         image_blocks=image_blocks,
                         per_criterion_frames=compacted.per_criterion,
                         context_facts=context_facts,
+                        run_context=run_context,
                     )
                     if image_blocks:
                         logger.info(
@@ -1470,6 +1499,7 @@ class RubricsVerifierTaskStep(TaskStep):
         image_blocks: Optional[list[dict]] = None,
         per_criterion_frames: bool = False,
         context_facts: Optional[list[tuple[str, str]]] = None,
+        run_context: Optional[Run] = None,
     ) -> str:
         """``context_facts`` are rendered ``(label, value)`` pairs (``resolve_context_facts``); ``image_blocks``
         are the blocks attached to the judge message, labels included when ``per_criterion_frames``."""
@@ -1501,6 +1531,10 @@ class RubricsVerifierTaskStep(TaskStep):
             )
         if loaded_artifacts:
             base += "\n\n" + self._build_loaded_artifacts_block(loaded_artifacts)
+        if run_context is not None and self.run_context_for_judge:
+            base += "\n\n" + render_run_context(run_context, self.run_context_for_judge,
+                                                 message_max_chars=self.RUN_CONTEXT_MESSAGE_MAX_CHARS,
+                                                 firings_max=self.RUN_CONTEXT_FIRINGS_MAX)
         if context_facts:
             # Facts before the policy: they are inputs, the policy is how to read them.
             base += "\n\n## Context facts\n" + self._CONTEXT_FACTS_LEAD + "\n" + "\n".join(
