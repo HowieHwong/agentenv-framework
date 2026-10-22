@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,13 @@ def _write_atomic(path, text):
     with open(path + ".tmp", "w") as f:
         f.write(text)
     os.replace(path + ".tmp", path)
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _epoch():
@@ -111,6 +119,21 @@ def _release(changelog_dir, name):
         _write_atomic(os.path.join(changelog_dir, "namespace.json"), json.dumps(committed))
 
 
+def _store(changelog_dir, cfg, k, local):
+    """Upload position k's archive through agent-env's namespace grant; False when the grant's limits refuse it."""
+    grant = WriteNamespaceGrant.model_validate(cfg["write_namespace"])
+    name = "%06d.tgz" % k
+    if not _reserve(changelog_dir, grant, name, os.path.getsize(local)):
+        sys.stderr.write("[changelog] skipped seq=%d: past the grant's limits\n" % k)
+        return False
+    try:
+        asyncio.run(NamespaceUploader(grant).upload(name, Path(local)))
+    except BaseException:
+        _release(changelog_dir, name)
+        raise
+    return True
+
+
 def main():
     cfg = json.load(open(CFG))
     changelog_dir, snar, roots, epoch = cfg["dir"], cfg["snar"], cfg["roots"], cfg.get("epoch")
@@ -135,7 +158,7 @@ def main():
     present = [r for r in roots if os.path.exists(r)]
     # The archives are incremental, so they're made in position order: wait for this position's turn, passing over
     # positions whose hook died first. A killed hook leaves a gap at its own position instead of shifting later ones.
-    archived = False
+    archived = stored = False
     while True:
         with open(os.path.join(changelog_dir, "lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -145,8 +168,8 @@ def main():
             while turn < k and not _alive(changelog_dir, turn):
                 turn += 1
             if turn == k:
-                # tar works on a copy of the incremental state, promoted only once tar has finished: a tar that
-                # outlives a killed hook advances nothing the next archive relies on. tar inherits the lock too.
+                # tar works on a copy of the incremental state, promoted only once the archive is stored: a tar that
+                # outlives a killed hook, or an upload that fails, leaves the writes for the next archive to carry.
                 work = "%s.%d" % (snar, k)
                 if os.path.exists(snar):
                     shutil.copyfile(snar, work)
@@ -154,34 +177,27 @@ def main():
                     ["tar", "--listed-incremental=" + work, "--exclude=" + changelog_dir, "-czf", local, *present],
                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(lock.fileno(),),
                 )
-                os.replace(work, snar)
                 archived = True
+                try:
+                    stored = _store(changelog_dir, cfg, k, local)
+                except Exception as e:
+                    sys.stderr.write("[changelog] upload of seq=%d failed; the next capture carries its writes: %s\n"
+                                     % (k, e))
+                finally:
+                    if stored:
+                        os.replace(work, snar)
+                    else:
+                        _remove(work)
+                    _remove(local)
             if turn >= k:
                 _write_atomic(turnf, str(max(turn, k + 1)))
                 break
         time.sleep(0.05)
-    try:
-        os.remove(held % k)
-    except OSError:
-        pass
+    _remove(held % k)
     if not archived:  # a later position went first, so this one would replay out of order
         sys.stderr.write("[changelog] skipped seq=%d: a later position was archived first\n" % k)
-        return
-    # agent-env's namespace grant, named by the absolute tool-call position.
-    grant = WriteNamespaceGrant.model_validate(cfg["write_namespace"])
-    name = "%06d.tgz" % k
-    try:
-        if not _reserve(changelog_dir, grant, name, os.path.getsize(local)):
-            sys.stderr.write("[changelog] skipped seq=%d: past the grant's limits\n" % k)
-            return
-        try:
-            asyncio.run(NamespaceUploader(grant).upload(name, Path(local)))
-        except BaseException:
-            _release(changelog_dir, name)
-            raise
-    finally:
-        os.remove(local)
-    sys.stderr.write("[changelog] captured seq=%d tool=%s -> %s\n" % (k, tool, name))
+    elif stored:
+        sys.stderr.write("[changelog] captured seq=%d tool=%s -> %06d.tgz\n" % (k, tool, k))
 
 
 if __name__ == "__main__":
@@ -277,30 +293,42 @@ def _stderr_tail(stderr: bytes) -> str:
     return stderr.decode(errors="replace").strip()[-_TAR_STDERR_TAIL:]
 
 
-class Changelog:
-    """The ``enable-changelog`` / ``apply-changelog`` pair.
+def _own_directory(path: Path) -> Path:
+    """``path`` made if missing, 0700; refused unless it's a real directory this process's user owns, since the
+    capture's config holds the grant and its scripts run as the agent."""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise HTTPException(status_code=500, detail=(
+            f"changelog directory {path} must be a directory, not a link, owned by uid {os.geteuid()}"))
+    path.chmod(0o700)
+    return path
 
-    ``install_hook(command)`` registers ``command`` as the CLI's post-tool hook. ``resume(target_context_id)`` makes
-    the restored conversation resumable and returns the context it's bound to, or None when there's nothing to
-    resume. ``after_apply()`` runs once increments are extracted, before any resume.
-    """
+
+class Changelog:
+    """The ``enable-changelog`` / ``apply-changelog`` pair: ``install_hook`` registers the capture as the CLI's
+    post-tool hook, ``after_apply`` runs once increments are extracted, and ``resume`` binds a context to the restored
+    conversation, or returns None when there's none."""
 
     def __init__(
         self,
         default_roots: Iterable[str],
         install_hook: Callable[[str], None],
         resume: Callable[[str | None], Awaitable[str | None]],
-        directory: Path | str,
-        after_apply: Callable[[], None] | None = None,
+        directory: Path,
+        after_apply: Callable[[], None],
     ) -> None:
         self.default_roots = list(default_roots)
         self.install_hook = install_hook
         self.resume = resume
         self.after_apply = after_apply
-        self.directory = str(directory)
-        self.snar = f"{self.directory}/state.snar"
-        self.config_path = f"{self.directory}/config.json"
-        self.capture_path = f"{self.directory}/capture.py"
+        self.directory = directory
+        self.snar = f"{directory}/state.snar"
+        self.config_path = f"{directory}/config.json"
+        self.capture_path = f"{directory}/capture.py"
         self.hook_command = f"{shlex.quote(sys.executable)} {shlex.quote(self.capture_path)}"
 
     def capture_script(self) -> str:
@@ -308,9 +336,8 @@ class Changelog:
         return CAPTURE_SCRIPT.replace(_DEFAULT_CONFIG_LINE, f"CFG = {json.dumps(self.config_path)}")
 
     async def enable(self, request: NamespaceChangelogEnableRequest) -> NamespaceChangelogEnableResponse:
-        """Write the capture script and config, baseline the incremental-tar snapshot so each increment is a pure
-        delta, and install the hook. Idempotent."""
-        # Omitted roots take the defaults; an explicit empty list would capture nothing.
+        """Write the capture script and config, baseline the incremental tar so each increment is a pure delta, and
+        install the hook. Idempotent."""
         roots = request.roots
         if roots is None:
             roots = list(self.default_roots)
@@ -322,32 +349,25 @@ class Changelog:
         return NamespaceChangelogEnableResponse(roots=roots)
 
     def _reset(self, roots: list[str], write_namespace: dict) -> None:
-        config = {"dir": self.directory, "snar": self.snar, "roots": roots, "epoch": uuid.uuid4().hex,
+        config = {"dir": str(self.directory), "snar": self.snar, "roots": roots, "epoch": uuid.uuid4().hex,
                   "write_namespace": write_namespace}
-        # The config carries the grant, so the directory is the agent user's alone.
-        os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        os.chmod(self.directory, 0o700)
+        _own_directory(self.directory)
         # Reset under both capture locks, so a hook still running for an earlier capture can't write into this one:
         # it finds the new epoch in the config and stops.
-        with open(os.path.join(self.directory, "lock"), "a") as lock, open(
-            os.path.join(self.directory, "seq.lock"), "a"
-        ) as seq_lock:
+        with open(self.directory / "lock", "a") as lock, open(self.directory / "seq.lock", "a") as seq_lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             fcntl.flock(seq_lock, fcntl.LOCK_EX)
             Path(self.capture_path).write_text(self.capture_script())
             Path(self.config_path).write_text(json.dumps(config))
             for stale in (
-                os.path.join(self.directory, "seq"),
-                os.path.join(self.directory, "turn"),
-                os.path.join(self.directory, "namespace.json"),
-                self.snar,
-                *(str(p) for p in Path(self.directory).glob("held.*")),
-                *(str(p) for p in Path(self.snar).parent.glob(Path(self.snar).name + ".*")),
+                self.directory / "seq",
+                self.directory / "turn",
+                self.directory / "namespace.json",
+                Path(self.snar),
+                *self.directory.glob("held.*"),
+                *self.directory.glob("state.snar.*"),
             ):
-                try:
-                    os.remove(stale)
-                except FileNotFoundError:
-                    pass
+                stale.unlink(missing_ok=True)
             present = [r for r in roots if os.path.exists(r)]
             subprocess.run(
                 ["tar", f"--listed-incremental={self.snar}", f"--exclude={self.directory}", "-cf", "/dev/null",
@@ -356,31 +376,21 @@ class Changelog:
             )
 
     async def apply(self, request: ObjectChangelogApplyRequest) -> ObjectChangelogApplyResponse:
-        """Reconstruct the writable layer by extracting the granted increments in sequence order; agent-env sends
-        them already cut at the requested tool call, and none is the valid pre-first-tool baseline.
-
-        Meant for a FRESH agent of the same image: extraction restores absolute paths under /, so files the
-        changelog removed are deleted too. As root it restores system directories as well; as another user the
-        writable roots still restore, and tar's exit status for each increment is logged. An increment that isn't a
-        readable archive fails the apply (422) before it's extracted.
-        """
+        """Extract the granted increments in order at / onto a fresh agent of the same image, deletions included; an
+        increment that isn't a readable archive fails the apply (422) before it's extracted."""
         applied = await self._apply_increments(request.increments)
         logger.info(f"agent-changelog applied {len(applied)} granted increments: {applied}")
-        if self.after_apply is not None:
-            self.after_apply()
+        self.after_apply()
         context_id = await self.resume(request.target_context_id) if request.resume_conversation else None
         return ObjectChangelogApplyResponse(count=len(applied), context_id=context_id)
 
     async def _apply_increments(self, increments: list[ChangelogIncrement]) -> list[dict]:
-        apply_dir = Path(self.directory) / "apply"
-        apply_dir.mkdir(parents=True, exist_ok=True)
+        apply_dir = _own_directory(_own_directory(self.directory) / "apply")
         applied: list[dict] = []
         for increment in increments:
             local = apply_dir / f"{increment.sequence:06d}.tgz"
             try:
                 await download(increment.object, local)
-                # Read through before extracting, so a corrupt or truncated capture fails the apply instead of
-                # counting as restored.
                 listing = await asyncio.to_thread(
                     subprocess.run, ["tar", "--incremental", "-tzf", str(local)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -391,7 +401,6 @@ class Changelog:
                         detail=f"changelog increment {increment.sequence:06d} is not a readable archive: "
                         f"{_stderr_tail(listing.stderr)}",
                     )
-                # Extracted at / so absolute member paths restore; --incremental honours deletions.
                 proc = await asyncio.to_thread(
                     subprocess.run, ["tar", "--incremental", "-xzf", str(local), "-C", "/"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -399,8 +408,8 @@ class Changelog:
             finally:
                 local.unlink(missing_ok=True)
             if proc.returncode != 0:
-                # Expected for members another user can't restore (e.g. "etc: Cannot utime: Operation not
-                # permitted"); the writable roots still restore, so it counts.
+                # Expected for members another user can't restore (e.g. "etc: Cannot utime"); the writable roots
+                # still restore, so it counts.
                 logger.warning(f"agent-changelog increment {increment.sequence:06d}: tar exited {proc.returncode}: "
                                f"{_stderr_tail(proc.stderr)}")
             applied.append({"seq": increment.sequence, "tar_rc": proc.returncode})

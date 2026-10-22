@@ -20,7 +20,7 @@ from agentenv_protocol.transfers import TransferError
 from starlette.exceptions import HTTPException
 from starlette.testclient import TestClient
 
-from tst.unit.agents.claude_code.agent import a2a_server, tar_changelog
+from tst.unit.agents.claude_code.agent import a2a_server, claude_bridge, tar_changelog
 from tst.unit.agents.claude_code.support import expiry, extension_methods, read_grant
 
 GNU_TAR = shutil.which("tar") is not None and tar_changelog.gnu_tar()
@@ -292,6 +292,7 @@ def test_a_capture_past_the_grants_object_limit_is_skipped_across_hook_processes
     assert sorted(staging.objects) == [f"{ROOT_PATH}/000000.tgz"]
     assert "skipped seq=1: past the grant's limits" in second.stderr
     assert not list((tmp_path / "changelog").glob("*.tgz"))
+    assert not list((tmp_path / "changelog").glob("state.snar.*"))
 
 
 @needs_gnu_tar
@@ -308,9 +309,35 @@ def test_a_refused_upload_gives_back_its_reservation_and_exits_zero(tmp_path, so
     finally:
         refusing.close()
 
-    assert refused.returncode == 0 and "hook error (non-fatal)" in refused.stderr
+    assert refused.returncode == 0 and "upload of seq=0 failed; the next capture carries its writes" in refused.stderr
     assert json.loads((tmp_path / "changelog" / "namespace.json").read_text()) == {}
     assert not list((tmp_path / "changelog").glob("*.tgz"))
+    assert not list((tmp_path / "changelog").glob("state.snar.*"))
+
+
+@needs_gnu_tar
+def test_the_writes_of_a_capture_that_wasnt_stored_go_with_the_next_one(tmp_path, staging):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    log, _, _, _ = _changelog(tmp_path, roots=[str(root)])
+    _enable(log)
+    baseline = (tmp_path / "changelog" / "state.snar").read_bytes()
+    refusing = Staging(status=403)
+
+    (root / "first.txt").write_text("one")
+    try:
+        _capture(log, refusing.port)
+    finally:
+        refusing.close()
+    unchanged = (tmp_path / "changelog" / "state.snar").read_bytes()
+    (root / "second.txt").write_text("two")
+    stored = _capture(log, staging.port)
+
+    assert unchanged == baseline
+    assert stored.returncode == 0 and "captured seq=1" in stored.stderr
+    assert sorted(staging.objects) == [f"{ROOT_PATH}/000001.tgz"]
+    assert sorted(_members(staging.objects[f"{ROOT_PATH}/000001.tgz"])) == [
+        str(root / "first.txt").lstrip("/"), str(root / "second.txt").lstrip("/")]
 
 
 @needs_gnu_tar
@@ -332,18 +359,6 @@ def test_apply_extracts_in_order_then_runs_after_apply_and_resumes_only_when_ask
     assert target.read_text() == "final"
     assert after == [True, True] and resumed == ["ctx"]
     assert not any((tmp_path / "changelog" / "apply").iterdir())
-
-
-def test_apply_without_after_apply_or_a_resumed_transcript(tmp_path):
-    async def nothing_to_resume(_target):
-        return None
-
-    log = tar_changelog.Changelog(default_roots=[], install_hook=lambda command: None, resume=nothing_to_resume,
-                              directory=tmp_path / "changelog")
-
-    answer = asyncio.run(log.apply(ObjectChangelogApplyRequest(increments=[], resume_conversation=True)))
-
-    assert answer.model_dump(exclude_none=True) == {"count": 0}
 
 
 def test_a_failed_increment_download_is_the_frameworks_typed_error(tmp_path, store):
@@ -512,16 +527,168 @@ def test_apply_without_a_restored_transcript_resumes_nothing(monkeypatch, tmp_pa
     assert response.status_code == 200 and response.json() == {"count": 0}
 
 
-def test_apply_refuses_while_a_turn_runs_and_onto_a_bound_context(monkeypatch, tmp_path):
+def test_apply_refuses_while_a_turn_runs_and_an_empty_target(monkeypatch, tmp_path):
     client, agent = _changelog_client(monkeypatch, tmp_path)
     agent._active_contexts.add("busy")
     running = client.put("/ext/snapshot/changelog", json={"increments": []})
     agent._active_contexts.clear()
-    agent.set_session_ref_for_context("taken", "session-1")
-    bound = client.put("/ext/snapshot/changelog", json={"increments": [], "target_context_id": "taken"})
     empty = client.put("/ext/snapshot/changelog", json={"increments": [], "target_context_id": ""})
 
     assert (running.status_code, running.json()["detail"]) == (
         409, "cannot apply a changelog while an agent turn is running")
-    assert bound.status_code == 409 and "already bound" in bound.json()["detail"]
     assert empty.status_code == 400
+
+
+def test_apply_rebinds_a_target_context_already_bound(monkeypatch, tmp_path):
+    client, agent = _changelog_client(monkeypatch, tmp_path)
+    _restored_transcript({"sessionId": "captured"})
+    agent.set_session_ref_for_context("rewound", "session-before")
+
+    response = client.put("/ext/snapshot/changelog",
+                          json={"increments": [], "resume_conversation": True, "target_context_id": "rewound"})
+
+    assert response.status_code == 200 and response.json() == {"count": 0, "context_id": "rewound"}
+    assert agent.session_ref_for_context("rewound") not in (None, "session-before")
+
+
+def _restored_transcript(*records: dict, name: str = "captured.jsonl", extra: str = "") -> None:
+    sessions = a2a_server.SESSION_JSONL_DIR
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / name).write_text("".join(json.dumps(record) + "\n" for record in records) + extra)
+
+
+def test_apply_resumes_the_largest_restored_transcript_with_its_session_ids_rewritten(monkeypatch, tmp_path):
+    client, agent = _changelog_client(monkeypatch, tmp_path)
+    _restored_transcript({"sessionId": "small"}, name="small.jsonl")
+    _restored_transcript({"sessionId": "large", "message": "x" * 100}, name="large.jsonl", extra="\nnot json\n")
+
+    result = client.put("/ext/snapshot/changelog",
+                        json={"increments": [], "resume_conversation": True, "target_context_id": "rewound"}).json()
+
+    assert result == {"count": 0, "context_id": "rewound"}
+    session_id = agent.session_ref_for_context("rewound")
+    lines = (a2a_server.SESSION_JSONL_DIR / f"{session_id}.jsonl").read_text().splitlines()
+    assert json.loads(lines[0]) == {"sessionId": session_id, "message": "x" * 100} and lines[1] == "not json"
+
+
+def test_apply_without_a_target_mints_the_context_it_resumes(monkeypatch, tmp_path):
+    client, agent = _changelog_client(monkeypatch, tmp_path)
+    _restored_transcript({"sessionId": "captured"})
+
+    result = client.put("/ext/snapshot/changelog", json={"increments": [], "resume_conversation": True}).json()
+
+    assert result["count"] == 0 and result["context_id"]
+    assert agent.session_ref_for_context(result["context_id"]) is not None
+
+
+def _hooks(command: str) -> dict:
+    return {"hooks": {event: [{"matcher": "", "hooks": [{"type": "command", "command": command}]}]
+                      for event in ("PostToolUse", "PostToolUseFailure")}}
+
+
+def test_enable_installs_the_capture_after_both_a_tool_that_succeeded_and_one_that_failed(
+        monkeypatch, tmp_path, agent_dirs):
+    client, agent = _changelog_client(monkeypatch, tmp_path)
+
+    response = client.post("/ext/snapshot/changelog", json={"write_namespace": namespace_grant()})
+
+    assert response.status_code == 200, response.text
+    settings = json.loads((agent_dirs / "settings.json").read_text())
+    for event in ("PostToolUse", "PostToolUseFailure"):
+        assert settings["hooks"][event] == [{"matcher": "", "hooks": [
+            {"type": "command", "command": agent._changelog.hook_command, "timeout": tar_changelog.HOOK_TIMEOUT_S}]}]
+
+
+def test_apply_drops_the_restored_capture_hooks_of_both_events(monkeypatch, tmp_path, agent_dirs):
+    client, _ = _changelog_client(monkeypatch, tmp_path)
+    agent_dirs.mkdir(parents=True)
+    (agent_dirs / "settings.json").write_text(json.dumps(_hooks(f"python3 {tmp_path / 'claude-code-changelog-9' / 'capture.py'}")))
+
+    response = client.put("/ext/snapshot/changelog", json={"increments": []})
+
+    assert response.status_code == 200
+    assert json.loads((agent_dirs / "settings.json").read_text()) == {
+        "hooks": {"PostToolUse": [], "PostToolUseFailure": []}}
+
+
+def test_a_snapshot_load_drops_the_capture_hooks_it_restored(monkeypatch, tmp_path, agent, client, store):
+    source_workspace, source_state = tmp_path / "source" / "app", tmp_path / "source" / "home" / ".claude"
+    (source_state / "projects" / "-app").mkdir(parents=True)
+    source_workspace.mkdir(parents=True)
+    kept = {"matcher": "", "hooks": [{"type": "command", "command": "echo kept"}]}
+    settings = _hooks(f"python3 {tmp_path / 'claude-code-changelog-9' / 'capture.py'}")
+    settings["hooks"]["PostToolUse"].append(kept)
+    (source_state / "settings.json").write_text(json.dumps(settings))
+    monkeypatch.setattr(a2a_server, "WORKSPACE_DIR", source_workspace)
+    monkeypatch.setattr(a2a_server, "CLAUDE_STATE_DIR", source_state)
+    archive = tmp_path / "workspace.tar.gz"
+    a2a_server._build_workspace_archive(archive)
+    destination_state = tmp_path / "destination" / "home" / ".claude"
+    (tmp_path / "destination" / "app").mkdir(parents=True)
+    monkeypatch.setattr(a2a_server, "WORKSPACE_DIR", tmp_path / "destination" / "app")
+    monkeypatch.setattr(a2a_server, "CLAUDE_STATE_DIR", destination_state)
+    conversation = json.dumps({"type": "user", "sessionId": "s"}).encode() + b"\n"
+    store.objects.update({"snap/workspace": archive.read_bytes(), "snap/trajectory": conversation})
+
+    response = client.put(a2a_server.SNAPSHOT_V1.endpoint, json={"objects": {
+        "trajectory": read_grant("snap/trajectory", len(conversation)),
+        "workspace": read_grant("snap/workspace", archive.stat().st_size)}})
+
+    assert response.status_code == 200, response.text
+    assert json.loads((destination_state / "settings.json").read_text()) == {
+        "hooks": {"PostToolUse": [kept], "PostToolUseFailure": []}}
+
+
+def _turns(monkeypatch, agent) -> list[str]:
+    """Run two contexts' turns at once; the order their CLIs started and ended in."""
+    events: list[str] = []
+
+    async def _run_claude(**kwargs):
+        events.append(f"start {kwargs['session_id']}")
+        await asyncio.sleep(0.05)
+        events.append(f"end {kwargs['session_id']}")
+        return claude_bridge.ClaudeResult(response="ok", tool_call_count=0, session_id=kwargs["session_id"])
+
+    monkeypatch.setattr(a2a_server, "run_claude", _run_claude)
+    for context in ("a", "b"):
+        agent.set_session_ref_for_context(context, context)
+
+    def request(context: str):
+        return a2a_server.TaskRequest(task_id=f"t-{context}", context_id=context,
+                                      parts=(a2a_server.TextPart(text="go"),), config=a2a_server.ClaudeCodeConfig())
+
+    async def both():
+        await asyncio.gather(agent.run(request("a")), agent.run(request("b")))
+
+    asyncio.run(both())
+    return events
+
+
+def test_while_a_changelog_is_captured_turns_take_turns(monkeypatch, tmp_path):
+    client, agent = _changelog_client(monkeypatch, tmp_path)
+    assert _turns(monkeypatch, agent)[:2] == ["start a", "start b"]
+
+    client.post("/ext/snapshot/changelog", json={"write_namespace": namespace_grant()})
+
+    assert _turns(monkeypatch, agent) == ["start a", "end a", "start b", "end b"]
+
+
+@pytest.mark.parametrize("make", ["symlink", "file"])
+def test_enable_and_apply_refuse_a_changelog_directory_that_isnt_one_this_user_owns(tmp_path, make):
+    directory = tmp_path / "changelog"
+    if make == "symlink":
+        (tmp_path / "elsewhere").mkdir()
+        directory.symlink_to(tmp_path / "elsewhere")
+    else:
+        directory.write_text("")
+    log, installed, after, _ = _changelog(tmp_path)
+
+    with pytest.raises(HTTPException) as enabled:
+        _enable(log, roots=[str(tmp_path)])
+    with pytest.raises(HTTPException) as applied:
+        asyncio.run(log.apply(ObjectChangelogApplyRequest(increments=[])))
+
+    for raised in (enabled, applied):
+        assert raised.value.status_code == 500 and "must be a directory, not a link" in raised.value.detail
+    assert installed == [] and after == []
+    assert not (tmp_path / "elsewhere" / "config.json").exists()

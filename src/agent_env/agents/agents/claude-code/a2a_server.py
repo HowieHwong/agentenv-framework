@@ -346,17 +346,21 @@ def _changelog_roots() -> list[str]:
     return outermost([str(Path.home()), str(CLAUDE_STATE_DIR), str(WORKSPACE_DIR), "/tmp/data", "/usr/local", "/etc"])
 
 
+# After every tool call, whether it succeeded or failed, so each call takes its position and its writes are captured.
+_CAPTURE_EVENTS = ("PostToolUse", "PostToolUseFailure")
+
+
 def _install_changelog_hook(command: str) -> None:
-    """The capture as a PostToolUse hook in the CLI's user settings, which `--setting-sources user` reads: after each
-    tool, so an increment holds that tool's writes, the last tool's included."""
-    merge_settings_hook(CLAUDE_STATE_DIR / "settings.json", event="PostToolUse", matcher="", command=command,
-                        timeout=HOOK_TIMEOUT_S)
+    """The capture as a hook in the CLI's user settings, which `--setting-sources user` reads."""
+    for event in _CAPTURE_EVENTS:
+        merge_settings_hook(CLAUDE_STATE_DIR / "settings.json", event=event, matcher="", command=command,
+                            timeout=HOOK_TIMEOUT_S)
 
 
 def _remove_restored_capture_hooks() -> None:
-    """Drop the capture hook an applied changelog restored with the CLI's settings: its script stays behind on the
-    agent that captured it."""
-    remove_settings_hooks(CLAUDE_STATE_DIR / "settings.json", event="PostToolUse", matches=is_missing_capture_command)
+    """Drop capture hooks restored with the CLI's settings, whose scripts stayed on the agent that captured."""
+    for event in _CAPTURE_EVENTS:
+        remove_settings_hooks(CLAUDE_STATE_DIR / "settings.json", event=event, matches=is_missing_capture_command)
 
 
 @asynccontextmanager
@@ -617,6 +621,7 @@ class ClaudeCodeAgent(DurableSessionRefs, AgentEnvAgent):
                         await asyncio.to_thread(_restore_workspace_archive, archive_path, keep)
                     except (tarfile.TarError, OSError, ValueError) as exc:
                         raise HTTPException(status_code=400, detail=f"invalid workspace archive: {exc}") from exc
+                    _remove_restored_capture_hooks()
                 SESSION_JSONL_DIR.mkdir(parents=True, exist_ok=True)
                 session_jsonl_path(new_session_id).write_text("\n".join(rewritten) + "\n")
                 self.set_session_ref_for_context(new_context_id, new_session_id)
@@ -636,11 +641,22 @@ class ClaudeCodeChangelogAgent(ClaudeCodeAgent):
         self._changelog = Changelog(default_roots=_changelog_roots(), install_hook=_install_changelog_hook,
                                     resume=self._resume_conversation, directory=changelog_dir(os.environ),
                                     after_apply=_remove_restored_capture_hooks)
+        # A changelog is one sequence of tool calls, so while one is captured, turns take turns.
+        self._capture_turn = asyncio.Lock()
+        self._capturing = False
+
+    async def run(self, request: TaskRequest[ClaudeCodeConfig]) -> TaskResult:
+        if not self._capturing:
+            return await super().run(request)
+        async with self._capture_turn:
+            return await super().run(request)
 
     @extension(SNAPSHOT_V1.changelog.enable)
     async def enable_changelog(self, request: NamespaceChangelogEnableRequest) -> NamespaceChangelogEnableResponse:
         """Capture each tool call's writes, uploaded as <root_path>/<position:06d>.tgz under the grant's limits."""
-        return await self._changelog.enable(request)
+        answer = await self._changelog.enable(request)
+        self._capturing = True
+        return answer
 
     @extension(SNAPSHOT_V1.changelog.apply)
     async def apply_changelog(self, request: ObjectChangelogApplyRequest) -> ObjectChangelogApplyResponse:
@@ -652,10 +668,6 @@ class ClaudeCodeChangelogAgent(ClaudeCodeAgent):
         async with self._contexts_lock:
             if self._active_contexts:
                 raise HTTPException(status_code=409, detail="cannot apply a changelog while an agent turn is running")
-            if request.target_context_id and self.session_ref_for_context(request.target_context_id) is not None:
-                raise HTTPException(status_code=409, detail=(
-                    f"context_id '{request.target_context_id}' is already bound — retry with a different "
-                    "target_context_id"))
             return await self._changelog.apply(request)
 
     async def _resume_conversation(self, target_context_id: str | None) -> str | None:
