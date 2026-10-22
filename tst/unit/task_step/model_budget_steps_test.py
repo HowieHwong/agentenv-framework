@@ -4,6 +4,7 @@ shared one, the context records the budget, and a key made for an agent that fai
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ def litellm(monkeypatch, local_stores):
 
 class _Agent:
     metadata: dict = {}
+    default_env_vars: dict = {}
 
     def __init__(self) -> None:
         self.closed = 0
@@ -98,6 +100,20 @@ async def test_a_budgeted_agent_pointed_at_another_endpoint_is_not_deployed(lite
     assert litellm.requests == [] and agent.env_vars is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["env_vars", "the agent's defaults"])
+async def test_a_budgeted_agent_whose_env_points_at_another_endpoint_is_not_deployed(litellm, agent, where):
+    elsewhere = {"LITELLM_BASE_URL": "https://elsewhere.test"}
+    if where == "the agent's defaults":
+        agent.default_env_vars = elsewhere
+    step = DeployAgentTaskStep(id="deploy", version=None, a2a_agent_id="a", agent_name="solver",
+                               env_vars=elsewhere if where == "env_vars" else None, model_budget_usd=3)
+
+    with pytest.raises(ValueError, match="configured model endpoint"):
+        await step.execute(TaskStepContext())
+    assert litellm.requests == [] and agent.env_vars is None
+
+
 def test_deploy_agent_round_trips_its_budget_and_refuses_a_key_beside_it():
     step = DeployAgentTaskStep(id="deploy", version=None, model_budget_usd=1.5)
     assert DeployAgentTaskStep.from_dict(step.to_dict()).model_budget_usd == 1.5
@@ -136,7 +152,7 @@ def _resolved(value):
     return lambda *args, **kwargs: asyncio.sleep(0, result=value)
 
 
-def _install(monkeypatch, *, required_params=("litellm_api_key",), card=None):
+def _install(monkeypatch, *, required_params=("litellm_api_key",), card=None, expires_at_utc=None):
     sandbox = _InstallSandbox()
     monkeypatch.setattr(sandbox_provider, "build_sandbox_provider",
                         lambda name: SimpleNamespace(get_sandbox=_resolved(sandbox)))
@@ -152,7 +168,7 @@ def _install(monkeypatch, *, required_params=("litellm_api_key",), card=None):
     monkeypatch.setattr(step, "_register_instance", lambda *args: SimpleNamespace(instance_id="solver-1"))
     context = TaskStepContext(deployed_sandboxes=[DeployedSandbox(
         sandbox_name="vm", sandbox_id="sb-1", sandbox_mode="vm", sandbox_type="local",
-        tunnel_urls={"8000": "http://127.0.0.1:8000"})])
+        tunnel_urls={"8000": "http://127.0.0.1:8000"}, expires_at_utc=expires_at_utc)])
     return step, sandbox, context
 
 
@@ -165,6 +181,17 @@ async def test_an_installed_agent_with_a_budget_is_installed_with_its_own_key(li
     [made] = litellm.keys.values()
     assert [s for s in sandbox.scripts if s.startswith("start ")] == [f"start --key {made.key}"]
     assert context.metadata["model_budgets"]["solver"]["max_usd"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_an_installed_agents_key_lasts_as_long_as_its_sandbox_and_an_hour(litellm, monkeypatch):
+    expires = datetime.now(timezone.utc) + timedelta(hours=6)
+    step, _, context = _install(monkeypatch, expires_at_utc=expires.strftime("%Y-%m-%d %H:%M UTC"))
+
+    await step.execute(context)
+
+    [made] = litellm.keys.values()
+    assert 7 * 3600 - 120 <= int(made.duration.removesuffix("s")) <= 7 * 3600
 
 
 @pytest.mark.asyncio

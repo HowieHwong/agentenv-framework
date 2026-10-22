@@ -7,10 +7,11 @@ belongs to no user, so the agent can't make, change or delete keys with it, and 
 expires an hour after the agent's TTL.
 
 A run records each budget in ``context.metadata["model_budgets"]``, by agent name: the budget, the key's alias and
-LiteLLM's id for it (the key's hash, which authenticates nothing), never the key itself. ``teardown_run`` blocks the
-key, so one an agent leaked is no use after the run. LiteLLM keeps it, and what it spent: LiteLLM writes spend to its
-database every 10 to 15 seconds, so a figure read at teardown could miss the agent's last calls, while the blocked
-key's own count takes them in.
+LiteLLM's id for it (the key's hash, which authenticates nothing), never the key itself. A retry that rolls a
+deployment back moves its budget into the ``retry_resets`` marker, as it does the deployment's sandbox. ``teardown_run``
+blocks every key the run made, so one an agent leaked is no use after the run. LiteLLM keeps it, and what it spent:
+LiteLLM writes spend to its database every 10 to 15 seconds, so a figure read at teardown could miss the agent's last
+calls, while the blocked key's own count takes them in.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 BUDGETS_KEY = "model_budgets"
+#: Where a retry rolls back a deployment's budget, in its ``retry_resets`` marker (``agent_env.task.task``).
+ROLLED_BACK_KEY = "rolled_back_model_budgets"
 #: How long a key outlives its agent's TTL: its clock starts before the agent's sandbox is made, which can take a
 #: while (an image build, say). A teardown blocks it long before.
 KEY_LIFETIME_MARGIN_SECONDS = 3600
@@ -116,10 +119,26 @@ def record(context: TaskStepContext, agent_name: str, key: BudgetKey) -> None:
     }
 
 
+def rolled_back(before: dict, after: dict) -> dict:
+    """The budgets in the stored context ``before`` an undo whose key the context ``after`` it no longer records, by
+    agent name, for the retry's ``retry_resets`` marker: the undo strips them, and ``revoke`` must still find them."""
+    kept = {budget.get("key_id") for budget in ((after.get("metadata") or {}).get(BUDGETS_KEY) or {}).values()}
+    return {name: budget for name, budget in ((before.get("metadata") or {}).get(BUDGETS_KEY) or {}).items()
+            if budget.get("key_id") not in kept}
+
+
+def _recorded(context: TaskStepContext) -> list[tuple[str, dict]]:
+    """Every budget ``context`` records: its agents', and those a retry rolled back."""
+    budgets = list((context.metadata.get(BUDGETS_KEY) or {}).items())
+    for reset in context.metadata.get("retry_resets") or []:
+        budgets.extend((reset.get(ROLLED_BACK_KEY) or {}).items())
+    return budgets
+
+
 async def revoke(context: TaskStepContext) -> None:
-    """Block each budget key ``context`` records that isn't blocked yet. Best-effort, as a teardown is: a failure is
-    logged, and the key expires on its own."""
-    for agent_name, budget in (context.metadata.get(BUDGETS_KEY) or {}).items():
+    """Block each budget key ``context`` records, a rolled-back deployment's too, that isn't blocked yet. Best-effort,
+    as a teardown is: a failure is logged, and the key expires on its own."""
+    for agent_name, budget in _recorded(context):
         if not budget.get("key_id") or budget.get("key_blocked"):
             continue
         try:  # a key already gone is as good as blocked

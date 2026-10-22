@@ -119,6 +119,30 @@ async def test_a_teardown_blocks_the_key_and_litellm_keeps_it(litellm, caplog):
     assert len(litellm.requests) == asked
 
 
+def test_a_rolled_back_budget_is_one_whose_key_the_undo_stripped():
+    def stored(**keys):
+        return {"metadata": {"model_budgets": {name: {"key_id": key_id} for name, key_id in keys.items()}}}
+
+    before = stored(solver="k1", critic="k2")
+    assert model_budget.rolled_back(before, stored(critic="k2")) == {"solver": {"key_id": "k1"}}
+    # redeployed under the same name, the agent has a new key, and the old one is still rolled back
+    assert model_budget.rolled_back(before, stored(solver="k3", critic="k2")) == {"solver": {"key_id": "k1"}}
+    assert model_budget.rolled_back(before, before) == {} and model_budget.rolled_back({}, {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_teardown_blocks_the_keys_a_retry_rolled_back_too(litellm):
+    old, new = await _make(), await _make()
+    context, stripped = TaskStepContext(), TaskStepContext()
+    model_budget.record(context, "solver", new)
+    model_budget.record(stripped, "solver", old)
+    context.metadata["retry_resets"] = [{"attempt": 2, model_budget.ROLLED_BACK_KEY: stripped.metadata["model_budgets"]}]
+
+    await model_budget.revoke(context)
+
+    assert litellm.keys[old.key_id].blocked and litellm.keys[new.key_id].blocked
+
+
 @pytest.mark.asyncio
 async def test_a_key_that_cannot_be_blocked_is_left_to_expire_and_the_others_are_blocked(litellm, caplog):
     context = TaskStepContext()

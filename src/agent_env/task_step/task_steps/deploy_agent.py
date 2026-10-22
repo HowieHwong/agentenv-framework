@@ -391,7 +391,9 @@ class DeployAgentTaskStep(TaskStep):
             budget_key = await model_budget.make_key(
                 agent_name=self.agent_name, max_usd=self.model_budget_usd,
                 ttl_seconds=self._resolved_ttl_seconds(context), attribution=deploy_attribution(self, context),
-                base_url=resolved_litellm_base_url,
+                # The endpoint the agent will call: as A2AAgent.deploy picks it, this step's env first, then the
+                # agent's own defaults, then the configured one.
+                base_url=env_vars.get("LITELLM_BASE_URL") or agent.default_env_vars.get("LITELLM_BASE_URL"),
             )
             deployed_agents.append(budget_key)
             env_vars["LITELLM_API_KEY"] = budget_key.key
