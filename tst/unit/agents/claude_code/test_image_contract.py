@@ -16,7 +16,7 @@ def test_every_file_the_image_copies_is_in_the_folder():
 
     assert copied and all((AGENT_DIR / name).is_file() for name in copied), copied
     # install.sh and run.sh are install/v1's; a build context pruned to what the Dockerfile reads keeps them so.
-    assert {"a2a_server.py", "claude_bridge.py", "kit.py", "entrypoint.sh", "install.sh", "run.sh"} <= set(copied)
+    assert {"a2a_server.py", "claude_bridge.py", "kit.py", "tar_changelog.py", "entrypoint.sh", "install.sh", "run.sh"} <= set(copied)
 
 
 def test_the_image_installs_the_protocol_alone_from_its_requirements():

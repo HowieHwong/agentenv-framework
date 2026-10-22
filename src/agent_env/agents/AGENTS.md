@@ -143,7 +143,9 @@ and `load`, restoring them into `target_context_id`. `load` runs on a fresh agen
 startup. The optional changelog uploads one increment per tool call and replays them in order.
 
 Reference: `ClaudeCodeAgent.save_snapshot` / `load_snapshot`. Changelog: `agents/pi/pi_agent.py`
-`enable_changelog` / `apply_changelog`, and `agents/pi/changelog.py`.
+`enable_changelog` / `apply_changelog`, and `agents/pi/changelog.py`, which captures in the agent's process; for a
+CLI that runs its tools itself, `ClaudeCodeChangelogAgent` and `agents/claude-code/tar_changelog.py`, which capture from
+the CLI's post-tool hook, and only where the host has GNU tar.
 
 ### `peer-agents/v1`, `/ext/peer-agents`
 

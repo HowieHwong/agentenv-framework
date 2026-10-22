@@ -39,6 +39,10 @@ from agentenv_protocol.a2a_agent import (
     ContextTrajectoryRequest,
     FilePart,
     InlineSkillRequest,
+    NamespaceChangelogEnableRequest,
+    NamespaceChangelogEnableResponse,
+    ObjectChangelogApplyRequest,
+    ObjectChangelogApplyResponse,
     ObjectSnapshotLoadRequest,
     ObjectSnapshotLoadResponse,
     ObjectSnapshotSaveRequest,
@@ -57,6 +61,16 @@ from agentenv_protocol.transfers import Uploaded, download, upload
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
+from tar_changelog import (
+    HOOK_TIMEOUT_S,
+    Changelog,
+    changelog_dir,
+    gnu_tar,
+    is_missing_capture_command,
+    merge_settings_hook,
+    outermost,
+    remove_settings_hooks,
+)
 from claude_bridge import (
     CLAUDE_STATE_DIR,
     SESSION_JSONL_DIR,
@@ -326,6 +340,25 @@ async def _fetch_granted_snapshot(objects: SnapshotReadObjects, archive_path: Pa
     return jsonl.decode(), objects.workspace is not None
 
 
+def _changelog_roots() -> list[str]:
+    """The changelog's default capture roots: the writable layer a fresh agent of the image reconstructs, the CLI's
+    state (and its transcripts) included."""
+    return outermost([str(Path.home()), str(CLAUDE_STATE_DIR), str(WORKSPACE_DIR), "/tmp/data", "/usr/local", "/etc"])
+
+
+def _install_changelog_hook(command: str) -> None:
+    """The capture as a PostToolUse hook in the CLI's user settings, which `--setting-sources user` reads: after each
+    tool, so an increment holds that tool's writes, the last tool's included."""
+    merge_settings_hook(CLAUDE_STATE_DIR / "settings.json", event="PostToolUse", matcher="", command=command,
+                        timeout=HOOK_TIMEOUT_S)
+
+
+def _remove_restored_capture_hooks() -> None:
+    """Drop the capture hook an applied changelog restored with the CLI's settings: its script stays behind on the
+    agent that captured it."""
+    remove_settings_hooks(CLAUDE_STATE_DIR / "settings.json", event="PostToolUse", matches=is_missing_capture_command)
+
+
 @asynccontextmanager
 async def _turns_stop_with_the_server(app: Starlette) -> AsyncIterator[None]:
     """The server's lifespan: as it shuts down, the CLIs of turns still running are killed with their tools, which
@@ -366,6 +399,7 @@ async def _turns_stop_with_the_server(app: Starlette) -> AsyncIterator[None]:
         enable(SKILL_CONFIG_V1, description="Register a skill the Claude Code CLI loads from its skills directory."),
         enable(SNAPSHOT_V1, description=(
             "Capture and restore the Claude Code conversation, its workspace and the CLI's state, "
+            "or, where the host has GNU tar, each tool call's writes as a changelog to replay onto a fresh agent, "
             "through agent-env's object-transfer grants.")),
         enable(
             INSTALL_V1,
@@ -594,11 +628,64 @@ class ClaudeCodeAgent(DurableSessionRefs, AgentEnvAgent):
         return ObjectSnapshotLoadResponse(context_id=new_context_id)
 
 
+class ClaudeCodeChangelogAgent(ClaudeCodeAgent):
+    """With snapshot/v1's changelog, which needs GNU tar's incremental archives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._changelog = Changelog(default_roots=_changelog_roots(), install_hook=_install_changelog_hook,
+                                    resume=self._resume_conversation, directory=changelog_dir(os.environ),
+                                    after_apply=_remove_restored_capture_hooks)
+
+    @extension(SNAPSHOT_V1.changelog.enable)
+    async def enable_changelog(self, request: NamespaceChangelogEnableRequest) -> NamespaceChangelogEnableResponse:
+        """Capture each tool call's writes, uploaded as <root_path>/<position:06d>.tgz under the grant's limits."""
+        return await self._changelog.enable(request)
+
+    @extension(SNAPSHOT_V1.changelog.apply)
+    async def apply_changelog(self, request: ObjectChangelogApplyRequest) -> ObjectChangelogApplyResponse:
+        """Reconstruct the writable layer from the granted increments, and with `resume_conversation` make the
+        restored transcript resumable."""
+        if request.target_context_id is not None and not request.target_context_id:
+            raise HTTPException(status_code=400, detail="target_context_id must be a non-empty string")
+        # Held across the restore, as a snapshot load is: no turn runs on a workspace being rewritten.
+        async with self._contexts_lock:
+            if self._active_contexts:
+                raise HTTPException(status_code=409, detail="cannot apply a changelog while an agent turn is running")
+            if request.target_context_id and self.session_ref_for_context(request.target_context_id) is not None:
+                raise HTTPException(status_code=409, detail=(
+                    f"context_id '{request.target_context_id}' is already bound — retry with a different "
+                    "target_context_id"))
+            return await self._changelog.apply(request)
+
+    async def _resume_conversation(self, target_context_id: str | None) -> str | None:
+        """Bind a context to the restored transcript under a fresh session id, so the next turn there resumes the
+        rewound conversation; None when no transcript was restored. The real transcript is the largest."""
+        candidates = list(SESSION_JSONL_DIR.glob("*.jsonl")) if SESSION_JSONL_DIR.is_dir() else []
+        if not candidates:
+            logger.info("agent-changelog resume: no restored transcript")
+            return None
+        source = max(candidates, key=lambda p: p.stat().st_size)
+        new_session_id = str(uuid.uuid4())
+        rewritten, _ = _rewrite_session_ids(source.read_text(), new_session_id)
+        session_jsonl_path(new_session_id).write_text("\n".join(rewritten) + "\n")
+        new_context_id = target_context_id or uuid.uuid4().hex
+        self.set_session_ref_for_context(new_context_id, new_session_id)
+        logger.info(f"agent-changelog resume: bound context {new_context_id} -> session {new_session_id} "
+                    f"(from {source.name})")
+        return new_context_id
+
+
+def agent_for_this_host() -> ClaudeCodeAgent:
+    """The agent, with the changelog where this host's tar can make its archives."""
+    return ClaudeCodeChangelogAgent() if gnu_tar() else ClaudeCodeAgent()
+
+
 def build_app(agent: ClaudeCodeAgent) -> Starlette:
     """The agent's Starlette app, answering errors with ``{"detail": ...}`` bodies."""
     return json_error_bodies(agent.create_app())
 
 
-app = build_app(ClaudeCodeAgent())
+app = build_app(agent_for_this_host())
 # install_agent reads the agent's card by importing this name from the image.
 AGENT_CARD = app.state.agentenv_a2a.card
