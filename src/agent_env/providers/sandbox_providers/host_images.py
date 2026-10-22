@@ -13,6 +13,7 @@ import asyncio
 import gzip
 import hashlib
 import io
+import json
 import logging
 import platform as host
 import subprocess
@@ -30,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 _SOURCES_LABEL = "dev.agentenv.sources"
 _SAVED_PREFIX = "host-images"
-_PULLED: set[str] = set()  # the names of the images ``pull`` had this machine's Docker hold, by their digest
 
 
 def host_platform() -> str:
@@ -43,9 +43,17 @@ def held(image: DockerImageArtifact) -> bool:
     return holds(image.image_name, sources(image))
 
 
-def holds(image_name: str, image_sources: str) -> bool:
-    """Whether this machine's Docker holds ``image_name`` built from ``image_sources``."""
-    return _built_from(image_name) == image_sources
+def holds(image_name: str, image_sources: str | None) -> bool:
+    """Whether this machine's Docker holds ``image_name`` built from ``image_sources``; never when there are none, as
+    for an image with no build context, which nothing here built."""
+    return image_sources is not None and _built_from(image_name) == image_sources
+
+
+def holds_digest(image: DockerImageArtifact) -> bool:
+    """Whether this machine's Docker holds ``image``, one with an ``image_digest``, under its name as the image that
+    digest names: pulled by it, or built here from the image's sources. A tag can name another image than the one a
+    version records, so holding its name isn't enough."""
+    return image.image_digest in _repo_digests(image.image_name) or held(image)
 
 
 def present(image_name: str) -> bool:
@@ -106,27 +114,20 @@ async def build_here(image: DockerImageArtifact) -> None:
 
 def pull(image: DockerImageArtifact) -> None:
     """Have this machine's Docker hold ``image``, one with an ``image_digest``, under its name, unless it already holds
-    one: pulled by its digest, or, when that fails, built from its build context. Raises RuntimeError when it can't be
-    pulled or built."""
+    it (``holds_digest``): pulled by its digest, or, when that fails, built from its build context. Raises RuntimeError
+    when it can't be pulled or built."""
     with holding_locks([f"image-pull:{image.pinned_name}"]):
-        if present(image.image_name):
-            _PULLED.add(image.image_name)
+        if holds_digest(image):
             return
         pulled = subprocess.run(["docker", "pull", image.pinned_name], capture_output=True, text=True, errors="replace")
         if pulled.returncode == 0:
             subprocess.run(["docker", "tag", image.pinned_name, image.image_name], capture_output=True, check=True)
-            _PULLED.add(image.image_name)
             return
     why = (pulled.stderr.strip().splitlines() or [f"docker pull exited {pulled.returncode}"])[-1]
     if not image.buildable:
         raise RuntimeError(f"Couldn't pull {image.pinned_name}: {why}")
     logger.warning("Couldn't pull %s, so it's built from its build context: %s", image.pinned_name, why)
     build(image)
-
-
-def pulled_here(image_name: str) -> bool:
-    """Whether ``pull`` had this machine's Docker hold ``image_name``, by its digest, in this process."""
-    return image_name in _PULLED
 
 
 async def pull_here(image: DockerImageArtifact) -> None:
@@ -149,6 +150,19 @@ def _built_from(image_name: str) -> str | None:
     except FileNotFoundError:  # no docker on PATH, so no image here; a build says so
         return None
     return (result.stdout.strip() or None) if result.returncode == 0 else None
+
+
+def _repo_digests(image_name: str) -> set[str]:
+    """The digests this machine's image ``image_name`` was pulled by, none when it has none or there's no such image."""
+    try:
+        result = subprocess.run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image_name],
+                                capture_output=True, text=True, errors="replace")
+    except FileNotFoundError:  # no docker on PATH, so no image here
+        return set()
+    try:
+        return {ref.rpartition("@")[2] for ref in json.loads(result.stdout) or []} if result.returncode == 0 else set()
+    except ValueError:
+        return set()
 
 
 def _saved_here(image: DockerImageArtifact) -> str:

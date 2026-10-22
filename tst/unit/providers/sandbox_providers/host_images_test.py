@@ -137,19 +137,20 @@ async def test_a_local_sandbox_pulls_only_images_this_machine_didnt_build(monkey
 
 @pytest.mark.asyncio
 async def test_a_local_sandbox_doesnt_pull_a_tag_again_over_the_image_its_digest_named(monkeypatch, docker):
-    """One ``prepare_image`` pulled by its digest, or held under a name pinned to one; another held tag is pulled again,
-    as is one ``prepare_image`` pulled that Docker no longer holds."""
+    """One its provider prepared, or held under a name pinned to a digest; another held tag is pulled again, as is one
+    its provider prepared that Docker no longer holds."""
     pinned, gone = f"ghcr.io/acme/tool:1@{_PUBLISHED_DIGEST}", "ghcr.io/acme/gone:1"
     held = {_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1"}
     monkeypatch.setattr(local_sandbox, "present", lambda name: name in held)
-    monkeypatch.setattr(host_images, "_PULLED", {_PUBLISHED_REF, gone})
+    sandbox = LocalSandbox()
+    sandbox.prepared = frozenset({_PUBLISHED_REF, gone})
     pulled = []
 
     async def pull(self, names):
         pulled.extend(names)
 
     monkeypatch.setattr(VmSandbox, "pull_images", pull)
-    await LocalSandbox().pull_images([_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1", gone])
+    await sandbox.pull_images([_PUBLISHED_REF, pinned, "ghcr.io/acme/tool:1", gone])
 
     assert pulled == ["ghcr.io/acme/tool:1", gone]
 
@@ -215,17 +216,17 @@ def _published(context):
                                        dockerfile_path=str(context / "Dockerfile"))
 
 
-def _docker_cli(monkeypatch, *, held=(), pull_fails=False):
-    """The docker commands ``pull`` runs, each recorded; Docker holds ``held``, and a pull exits 1 when ``pull_fails``."""
+def _docker_cli(monkeypatch, *, pulled_by=None, pull_fails=False):
+    """The docker commands ``pull`` runs, each recorded; ``pulled_by`` maps each image Docker holds to the digests it was
+    pulled by, and a pull exits 1 when ``pull_fails``."""
     ran = []
-    monkeypatch.setattr(host_images, "_PULLED", set())
 
     def run(argv, **kwargs):
         ran.append(argv[1:])
         failed = pull_fails and argv[1] == "pull"
         return subprocess.CompletedProcess(argv, int(failed), "", "Error response from daemon: denied" if failed else "")
 
-    monkeypatch.setattr(host_images, "present", lambda name: name in held)
+    monkeypatch.setattr(host_images, "_repo_digests", lambda name: (pulled_by or {}).get(name, set()))
     monkeypatch.setattr(host_images.subprocess, "run", run)
     return ran
 
@@ -237,15 +238,47 @@ def test_a_published_image_is_pulled_by_its_digest_and_tagged_with_its_name(loca
     host_images.pull(_published(context))
 
     assert ran == [["pull", _PINNED], ["tag", _PINNED, _PUBLISHED_REF]]
-    assert docker[0] == [] and host_images.pulled_here(_PUBLISHED_REF)
+    assert docker[0] == []
 
 
-def test_a_published_image_docker_holds_under_its_name_isnt_pulled_again(local_stores, context, docker, monkeypatch):
-    ran = _docker_cli(monkeypatch, held={_PUBLISHED_REF})
+def test_a_published_image_docker_holds_by_its_digest_isnt_pulled_again(local_stores, context, docker, monkeypatch):
+    ran = _docker_cli(monkeypatch, pulled_by={_PUBLISHED_REF: {_PUBLISHED_DIGEST}})
 
     host_images.pull(_published(context))
 
-    assert ran == [] and docker[0] == [] and host_images.pulled_here(_PUBLISHED_REF)
+    assert ran == [] and docker[0] == []
+
+
+def test_a_published_image_built_here_from_its_sources_isnt_pulled(local_stores, context, docker, monkeypatch):
+    ran = _docker_cli(monkeypatch)
+    image = _published(context)
+    docker[1][_PUBLISHED_REF] = image.source_digest
+
+    host_images.pull(image)
+
+    assert ran == [] and docker[0] == []
+
+
+def test_a_tag_docker_holds_as_another_image_is_pulled_by_the_digest_and_moved_to_it(local_stores, context, docker,
+                                                                                   monkeypatch):
+    """Two versions can share a tag that names other images over time: the one a version records is the one run."""
+    ran = _docker_cli(monkeypatch, pulled_by={_PUBLISHED_REF: {"sha256:" + "d" * 64}})
+
+    host_images.pull(_published(context))
+
+    assert ran == [["pull", _PINNED], ["tag", _PINNED, _PUBLISHED_REF]]
+
+
+@pytest.mark.parametrize("printed, code, digests", [
+    ('["ghcr.io/acme/tool@sha256:aa","mirror.gcr.io/acme/tool@sha256:bb"]', 0, {"sha256:aa", "sha256:bb"}),
+    ("null", 0, set()),
+    ("", 1, set()),
+], ids=["pulled", "built", "absent"])
+def test_the_digests_an_image_was_pulled_by_are_read_from_docker(monkeypatch, printed, code, digests):
+    monkeypatch.setattr(host_images.subprocess, "run",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, code, printed, ""))
+
+    assert host_images._repo_digests("ghcr.io/acme/tool:1") == digests
 
 
 def test_a_published_image_that_cant_be_pulled_is_built_from_its_build_context(local_stores, context, docker,
@@ -292,4 +325,6 @@ async def test_the_local_provider_pulls_a_published_image_and_builds_one_that_is
         await provider.prepare_image(image)
 
     assert (pulled, built) == ([_PUBLISHED_REF], [context_only.image_name])
+    assert (await provider.create_vm()).prepared == {_PUBLISHED_REF}  # its containers start from it as it is
+    assert LocalSandboxProvider()._prepared == set()
 

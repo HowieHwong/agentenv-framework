@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, NoReturn, TypeVar, overload
 
 from agent_env.artifact.artifact import Artifact
+from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.entity.refs import EntityKind, parse_toml_ref
 from agent_env.env.env import Env
 from agent_env.env.envs._deployment import provider_refusal
@@ -258,16 +259,29 @@ def build_context_files(bundle: Bundle, entry: BundleEntry) -> dict[str, Path]:
     return dict(sorted(files.items()))
 
 
+@dataclass(frozen=True)
+class StagedContext:
+    """A copy of ``build_context_files`` for the image an entry's Dockerfile builds, so an image written from it was
+    made from what the ledger hashed."""
+
+    path: Path
+    dockerfile: str  # its whole path in the copy: a bare name is looked up from the current folder first
+
+    def identity(self, image_id: str) -> tuple[str, str]:
+        """The ``source_digest`` and ``image_name`` ``put_context`` gives ``image_id`` from this copy, built for each
+        sandbox's own platform, as a bundle writes its images."""
+        return DockerImageArtifact.context_identity(image_id, str(self.path), self.dockerfile, platform=None)
+
+
 @contextmanager
-def staged_build_context(bundle: Bundle, entry: BundleEntry) -> Iterator[Path]:
-    """A folder holding a copy of ``build_context_files``, so an image written from it was made from what the ledger
-    hashed."""
+def staged_build_context(bundle: Bundle, entry: BundleEntry, dockerfile: str) -> Iterator[StagedContext]:
+    """``entry``'s ``StagedContext`` for its ``dockerfile``, a path in its folder, removed on leaving."""
     with tempfile.TemporaryDirectory(prefix="agent-env-build-") as staged:
         context = Path(staged)
         for key, path in build_context_files(bundle, entry).items():
             (context / key).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, context / key)
-        yield context
+        yield StagedContext(context, str(context / dockerfile))
 
 
 def entry_file(bundle: Bundle, entry: BundleEntry) -> tuple[str, Path]:

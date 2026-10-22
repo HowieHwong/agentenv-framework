@@ -82,7 +82,8 @@ _NOTHING_TO_RUN = "this bundle has no tasks or evals to run"
 
 @dataclass(frozen=True)
 class Publication:
-    """The image published for the sources a bundle builds an agent's image from."""
+    """The image published for the sources a bundle builds an agent's image from, which the run registers by its tag
+    and digest, with those sources as its build context."""
 
     ref: str  # its repository and source tag
     digest: str
@@ -91,6 +92,12 @@ class Publication:
     @property
     def pinned(self) -> str:
         return f"{self.ref}@{self.digest}"
+
+    def unwritten(self, image_id: str) -> DockerImageArtifact:
+        """The image as the run will store it as ``image_id``, but for its build context, which only the write uploads:
+        what a deploy's providers are checked against before it's written."""
+        return DockerImageArtifact(id=image_id, description="", image_name=self.ref, image_digest=self.digest,
+                                   source_digest=self.sources)
 
 
 @dataclass(frozen=True)
@@ -820,10 +827,9 @@ class _Planner:
             image = write.source
             if not (isinstance(image, BuiltImage) and image.entry.kind is BundleKind.AGENT):
                 continue
-            with staged_build_context(self._bundle_of(image.entry), image.entry) as context:
+            with staged_build_context(self._bundle_of(image.entry), image.entry, image.dockerfile) as staged:
                 try:
-                    sources, _ = DockerImageArtifact.context_identity(write.id, str(context),
-                                                                      str(context / image.dockerfile), platform=None)
+                    sources, _ = staged.identity(write.id)
                 except ValueError:  # a context its write refuses, which says why
                     continue
             if (found := published_agent_image(sources)) is not None:
